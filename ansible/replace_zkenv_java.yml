@@ -1,0 +1,341 @@
+---
+# replace_zkenv_java.yml - find every zkEnv.sh under /data*/*solr* and point its Java path at /usr/java/jdk.
+#   e.g.  JAVA_HOME=/usr/java/jdk-21.0.1   ->   JAVA_HOME=/usr/java/jdk
+#
+# Usage:
+#   ansible-playbook -i inventory.ini replace_zkenv_java.yml -e dry_run=true      # DRY RUN: lists what would change, edits nothing
+#   ansible-playbook -i inventory.ini replace_zkenv_java.yml --check              # same as dry_run=true
+#   ansible-playbook -i inventory.ini replace_zkenv_java.yml -l web01             # real run, one server first
+#   ansible-playbook -i inventory.ini replace_zkenv_java.yml                      # real run, all servers
+#   ... -e skip_jdk_check=true         # do not require /usr/java/jdk/bin/java to exist
+#   ... -e '{"solr_globs": ["/data*/*solr*", "/opt/solr*"]}'      # where to look (shell globs, default /data*/*solr*)
+#   ... -e zk_file=zkEnv.sh            # file name to look for (default zkEnv.sh)
+#
+# Which files: every regular file named zkEnv.sh anywhere below a folder matching /data*/*solr*
+#   (e.g. /data/solr/solr-8.11/server/scripts/cloud-scripts/zkEnv.sh, /data2/asolr/.../zkEnv.sh). Symlinks are skipped.
+#
+# Also changed: /home/solr/.bash_profile (list: user_files, user: solr_user). It is edited AS the solr user
+#   (root runs it through `runuser -u solr`), so it stays owned by solr. Skipped if the user or the file does not exist.
+#   It is scanned, backed up and verified exactly like zkEnv.sh.
+#   In these user files a plain JAVA_HOME line is SET to /usr/java/jdk whatever it holds now, e.g.
+#     export JAVA_HOME=/usr/lib/jvm/java-1.8.0-openjdk   ->   export JAVA_HOME=/usr/java/jdk
+#   (quotes and a trailing comment are kept; a JAVA_HOME built from $VAR or $(...) is listed for MANUAL REVIEW, not changed).
+#   Turn this off with -e set_java_home=false (then only jdk-* paths are replaced). zkEnv.sh files are NOT treated this way.
+#
+# What is replaced: a FULL path whose last folder is jdk-<something> (same rule as replace_jdk_paths.yml), e.g.
+#   /opt/jdk-17.0.5  /usr/java/jdk-21.0.2  -> /usr/java/jdk      (anything after it, like /bin/java, is kept)
+#
+# What is NOT replaced (shown in the report):
+#   MANUAL REVIEW - a line with jdk-<x> that is not a full path (JDK=jdk-17.0.5, ${BASE}/jdk-17)
+#   INFO          - a JAVA_HOME / SOLR_JAVA_HOME line that does not mention jdk- (e.g. JAVA_HOME=/opt/java): shown so you can see it
+#
+# Safety:
+#   - every file is backed up first to /var/backups/jdk_path_replace/<timestamp>/<original path>  (same place as
+#     replace_jdk_paths.yml, so verify_java.yml-style checks and the restore command are identical)
+#       restore on the server:  cp -a /var/backups/jdk_path_replace/<timestamp>/. /
+#   - file owner, group and permissions are kept
+#   - refuses to run if /usr/java/jdk/bin/java does not exist unless skip_jdk_check=true
+#   - nothing is restarted. zkEnv.sh is read each time a Solr / zkcli script runs, so a running Solr keeps the old
+#     Java until it is restarted.
+#
+# Works on current Ansible and on Ansible 2.9 (commands use argv).
+# Output (control node, report_dir default ./java_zkenv_reports):  zkenv_report.csv
+#   (host, type [REPLACE / MANUAL REVIEW / INFO], file, line, action, text)
+
+- name: Replace jdk-* paths with /usr/java/jdk in zkEnv.sh files under Solr
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    dry_run: false
+    java_dest: /usr/java/jdk
+    skip_jdk_check: false
+    zk_file: zkEnv.sh
+    solr_globs: ["/data*/*solr*"]
+    solr_user: solr
+    user_files: ["/home/solr/.bash_profile"]     # edited as solr_user (-e '{"user_files": [...]}' to change the list)
+    set_java_home: true        # in user_files, a plain  JAVA_HOME=<path>  line is set to java_dest whatever it holds now (-e set_java_home=false to only replace jdk-* paths)
+    backup_root: /var/backups/jdk_path_replace
+    report_dir: "{{ playbook_dir }}/java_zkenv_reports"
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+
+    # Full path ending in a jdk-<x> folder (identical to replace_jdk_paths.yml).
+    jdk_path_regex: |-
+      (?:(?<=[\s=:;"'(])|^)/(?:[^\s:;"'=$]*/)?jdk-[^/\s:;"'$]*(?<!-unused)(?=[/\s:;"')]|$)
+
+    py_bin: "{{ ansible_python_interpreter | default(ansible_facts['discovered_interpreter_python'] | default('python3')) }}"
+
+    # Finds the files. The shell expands the globs (/data*/*solr*).
+    find_cmd: |
+      for d in $V_GLOBS; do
+        [ -d "$d" ] || continue
+        find "$d" -type f -name "$V_NAME" 2>/dev/null
+      done | sort -u
+      exit 0
+
+    # REPLACE = line matches the path regex, REVIEW = mentions jdk- but is not a full path,
+    # INFO = JAVA_HOME / SOLR_JAVA_HOME assignment without jdk-.  Python 2.6+ and 3.
+    scan_py: |
+      import os, re, sys
+
+      def emit(s):
+          if sys.version_info[0] >= 3:
+              sys.stdout.write(s + "\n")
+          else:
+              sys.stdout.write(s.encode("utf-8") + "\n")
+
+      pat = re.compile(os.environ["V_PAT"])
+      jh = re.compile(r"^\s*(?:export\s+)?(?:SOLR_)?JAVA_HOME\s*=")
+      # files where a plain JAVA_HOME=<path> line is forced to V_DEST (the solr user's files)
+      sethome = [x for x in os.environ.get("V_SETHOME", "").split("\n") if x]
+      dest = os.environ.get("V_DEST", "")
+      jhv = re.compile(r"^[ \t]*(?:export[ \t]+)?JAVA_HOME=([\"']?)([^\"'\s#;$`()]+)\1[ \t\r]*(?:#.*)?$")
+      for f in os.environ.get("V_FILES", "").split("\n"):
+          if not f or not os.path.isfile(f):
+              continue
+          try:
+              fh = open(f, "rb")
+              data = fh.read()
+              fh.close()
+          except Exception:
+              continue
+          if b"\0" in data:
+              continue
+          text = data.decode("utf-8", "replace")
+          name = f
+          if sys.version_info[0] < 3:
+              name = f.decode("utf-8", "replace")
+          n = 0
+          for line in text.split("\n"):
+              n += 1
+              line = line.rstrip("\r")
+              if "jdk-" in line:
+                  kind = "REPLACE" if pat.search(line) else "REVIEW"
+                  emit(u"%s|%s|%d|%s" % (kind, name, n, line))
+              elif f in sethome and jh.search(line) and line.lstrip().startswith(("JAVA_HOME", "export JAVA_HOME", "export  JAVA_HOME")):
+                  m = jhv.match(line)
+                  if m and m.group(2) == dest:
+                      pass
+                  elif m:
+                      emit(u"REPLACE|%s|%d|%s" % (name, n, line))
+                  else:
+                      emit(u"REVIEW|%s|%d|%s" % (name, n, line))
+              elif jh.search(line):
+                  emit(u"INFO|%s|%d|%s" % (name, n, line))
+
+    # Run as the solr user: rewrites each file in place with the path regex replaced (keeps owner and mode).
+    edit_py: |
+      import os, re, sys
+      pat = re.compile(os.environ["V_PAT"])
+      repl = os.environ["V_REPL"]
+      sethome = os.environ.get("V_SET_JAVA_HOME", "") == "true"
+      jhv = re.compile(r"^([ \t]*(?:export[ \t]+)?JAVA_HOME=)([\"']?)([^\"'\s#;$`()]+)\2(?=[ \t\r]*(?:#.*)?$)", re.M)
+      for f in os.environ.get("V_FILES", "").split("\n"):
+          if not f or not os.path.isfile(f) or os.path.islink(f):
+              continue
+          fh = open(f, "rb")
+          data = fh.read()
+          fh.close()
+          text = data.decode("latin-1")
+          new = pat.sub(lambda m: repl, text)
+          if sethome:
+              new = jhv.sub(lambda m: m.group(1) + m.group(2) + repl + m.group(2), new)
+          if new != text:
+              fh = open(f, "wb")
+              fh.write(new.encode("latin-1"))
+              fh.close()
+              sys.stdout.write("CHANGED|%s\n" % f)
+          else:
+              sys.stdout.write("UNCHANGED|%s\n" % f)
+
+  tasks:
+    # ---------- 1. find the zkEnv.sh files (read-only) ----------
+    - name: Find {{ zk_file }} under the Solr folders
+      ansible.builtin.command:
+        argv: ["/bin/sh", "-c", "{{ find_cmd }}"]
+      environment:
+        V_GLOBS: "{{ solr_globs | join(' ') }}"
+        V_NAME: "{{ zk_file }}"
+      register: found
+      changed_when: false
+      check_mode: false
+
+    # The solr user's own files (default /home/solr/.bash_profile): checked here, edited later AS that user.
+    - name: Check that the user exists
+      ansible.builtin.command:
+        argv: [id, -u, "{{ solr_user }}"]
+      register: uid_chk
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Check the user's files
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ user_files }}"
+      register: ufs
+
+    - name: Remember the files
+      ansible.builtin.set_fact:
+        zk_only: "{{ found.stdout_lines | select('match', '^/') | list }}"
+        user_paths: "{{ (ufs.results | selectattr('stat.exists') | rejectattr('stat.islnk') | map(attribute='item') | list) if (uid_chk.rc == 0) else [] }}"
+
+    - name: Combine the files
+      ansible.builtin.set_fact:
+        zk_files: "{{ zk_only + user_paths }}"
+
+    - name: Show the files found
+      ansible.builtin.debug:
+        msg: >-
+          {{ (['DRY RUN - no file is changed'] if (is_dry | bool) else [])
+             + [(zk_only | length) ~ ' ' ~ zk_file ~ ' file(s) found under ' ~ (solr_globs | join(', '))]
+             + zk_only
+             + [(user_paths | length) ~ ' file(s) of user ' ~ (solr_user | string) ~ ' (edited as ' ~ (solr_user | string) ~ ')'
+                ~ ('' if (uid_chk.rc == 0) else ' - user ' ~ (solr_user | string) ~ ' does not exist on this server, skipped')]
+             + user_paths }}
+
+    # ---------- 2. list the exact lines (read-only) ----------
+    - name: Scan the files for Java paths
+      ansible.builtin.command:
+        argv: ["{{ py_bin }}", "-"]
+        stdin: "{{ scan_py }}"
+      environment:
+        V_FILES: "{{ zk_files | join('\n') }}"
+        V_PAT: "{{ jdk_path_regex }}"
+        V_SETHOME: "{{ (user_paths | join('\n')) if (set_java_home | bool) else '' }}"
+        V_DEST: "{{ java_dest }}"
+      register: scan
+      changed_when: false
+      check_mode: false
+      when: zk_files | length > 0
+
+    - name: Sort the findings
+      ansible.builtin.set_fact:
+        hits: "{{ scan.stdout_lines | default([]) | select('match', '^(REPLACE|REVIEW|INFO)[|]') | list }}"
+        rep_files: "{{ scan.stdout_lines | default([]) | select('match', '^REPLACE[|]') | map('regex_replace', '^REPLACE[|]([^|]*)[|].*$', '\\1') | unique | sort | list }}"
+        rep_lines: "{{ scan.stdout_lines | default([]) | select('match', '^REPLACE[|]') | list }}"
+        rev_lines: "{{ scan.stdout_lines | default([]) | select('match', '^REVIEW[|]') | list }}"
+        info_lines: "{{ scan.stdout_lines | default([]) | select('match', '^INFO[|]') | list }}"
+        rep_dry: "{{ is_dry | bool }}"
+
+    - name: Show what was found
+      ansible.builtin.debug:
+        msg: >-
+          {{ [(rep_files | length) ~ ' file(s) / ' ~ (rep_lines | length) ~ ' line(s) would be replaced with ' ~ java_dest
+                ~ ', ' ~ (rev_lines | length) ~ ' line(s) need MANUAL REVIEW, ' ~ (info_lines | length) ~ ' JAVA_HOME line(s) for information']
+             + (rep_lines | map('regex_replace', '^REPLACE[|]', '[REPLACE] ') | map('replace', '|', ' : ', 2) | list)
+             + (rev_lines | map('regex_replace', '^REVIEW[|]', '[REVIEW ] ') | map('replace', '|', ' : ', 2) | list)
+             + (info_lines | map('regex_replace', '^INFO[|]', '[INFO   ] ') | map('replace', '|', ' : ', 2) | list) }}
+
+    # ---------- 3. safety checks ----------
+    - name: Check that the target JDK exists on this server
+      ansible.builtin.stat:
+        path: "{{ java_dest }}/bin/java"
+      register: jdk_stat
+
+    - name: Warn in a dry run if the target JDK is missing
+      ansible.builtin.debug:
+        msg: "WARNING: {{ java_dest }}/bin/java does not exist on {{ inventory_hostname }} - a real run would stop here (deploy the JDK first)."
+      when: (is_dry | bool) and not jdk_stat.stat.exists and (rep_files | length) > 0
+
+    - name: Refuse to point files at a JDK that is not there
+      ansible.builtin.fail:
+        msg: "{{ java_dest }}/bin/java does not exist on {{ inventory_hostname }}. Deploy the JDK first (deploy_java.yml) or use -e skip_jdk_check=true."
+      when: not (is_dry | bool) and (rep_files | length) > 0 and not jdk_stat.stat.exists and not (skip_jdk_check | bool)
+
+    # ---------- 4. back up, then replace ----------
+    - name: Work out the backup folder
+      ansible.builtin.set_fact:
+        backup_dir: "{{ backup_root }}/{{ now(fmt='%Y%m%d%H%M%S') }}"
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Create the backup folder
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Back up every file that will be changed (original path is kept under the backup folder)
+      ansible.builtin.command:
+        argv: [cp, -p, --parents, "{{ item }}", "{{ backup_dir }}/"]
+      loop: "{{ rep_files }}"
+      changed_when: true
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Replace the jdk-* paths with {{ java_dest }} (zkEnv.sh files)
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: "{{ jdk_path_regex }}"
+        replace: "{{ java_dest }}"
+      loop: "{{ rep_files | difference(user_paths) }}"
+      register: replace_res
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    # The solr user's files are edited BY the solr user (runuser from root), so they stay owned by it.
+    # (runuser is used instead of become_user because an -e ansible_become_user=root would override become_user.)
+    - name: Replace the jdk-* paths in {{ solr_user }}'s own files, running as {{ solr_user }}
+      ansible.builtin.command:
+        argv: [runuser, -u, "{{ solr_user }}", --, "{{ py_bin }}", "-"]
+        stdin: "{{ edit_py }}"
+      environment:
+        V_FILES: "{{ rep_files | intersect(user_paths) | join('\n') }}"
+        V_PAT: "{{ jdk_path_regex }}"
+        V_REPL: "{{ java_dest }}"
+        V_SET_JAVA_HOME: "{{ set_java_home | bool | lower }}"
+      register: user_edit
+      changed_when: "'CHANGED|' in user_edit.stdout"
+      when: not (is_dry | bool) and (rep_files | intersect(user_paths) | length) > 0
+
+    # ---------- 5. verify ----------
+    - name: Scan again to confirm nothing replaceable is left
+      ansible.builtin.command:
+        argv: ["{{ py_bin }}", "-"]
+        stdin: "{{ scan_py }}"
+      environment:
+        V_FILES: "{{ rep_files | join('\n') }}"
+        V_PAT: "{{ jdk_path_regex }}"
+        V_SETHOME: "{{ (user_paths | join('\n')) if (set_java_home | bool) else '' }}"
+        V_DEST: "{{ java_dest }}"
+      register: scan_after
+      changed_when: false
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Result for this server
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ ((zk_files | length) ~ ' ' ~ zk_file ~ ' found, ' ~ (rep_files | length) ~ ' file(s) WOULD be changed, ' ~ (rev_lines | length) ~ ' line(s) need manual review') if (is_dry | bool)
+             else ((zk_files | length) ~ ' ' ~ zk_file ~ ' found, ' ~ (rep_files | length) ~ ' file(s) changed (backup: ' ~ (backup_dir | default('none')) ~ '); replaceable lines left: '
+                   ~ ((scan_after.stdout_lines | default([]) | select('match', '^REPLACE[|]') | list | length) if (rep_files | length) > 0 else 0)
+                   ~ '; ' ~ (rev_lines | length) ~ ' line(s) need manual review. Restart Solr to use the new path') }}
+
+- name: zkEnv.sh report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dry_run: false
+    report_dir: "{{ playbook_dir }}/java_zkenv_reports"
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+  tasks:
+    - name: Create the report folder
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      when: not (is_dry | bool)
+
+    - name: Write zkenv_report.csv
+      ansible.builtin.copy:
+        content: |
+          host,type,file,line,action,text
+          {% for h in groups['all'] if hostvars[h].hits is defined %}
+          {% for x in hostvars[h].hits %}
+          {% set f = x.split('|', 3) %}
+          {{ h }},{{ 'REPLACE' if f[0] == 'REPLACE' else ('MANUAL REVIEW' if f[0] == 'REVIEW' else 'INFO') }},{{ f[1] }},{{ f[2] }},{{ ('WOULD REPLACE' if hostvars[h].rep_dry else 'REPLACED') if f[0] == 'REPLACE' else ('NOT CHANGED - review by hand' if f[0] == 'REVIEW' else 'NOT CHANGED - information only') }},"{{ f[3] | replace('"', '""') }}"
+          {% endfor %}
+          {% endfor %}
+        dest: "{{ report_dir }}/zkenv_report.csv"
+        mode: "0644"
+      when: not (is_dry | bool)

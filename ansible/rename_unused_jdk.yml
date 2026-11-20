@@ -1,0 +1,229 @@
+---
+# rename_unused_jdk.yml - rename jdk-* folders to jdk-*-unused on all servers, but ONLY the ones nothing uses.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini rename_unused_jdk.yml -e dry_run=true      # DRY RUN: shows what would be renamed
+#   ansible-playbook -i inventory.ini rename_unused_jdk.yml --check              # same as dry_run=true
+#   ansible-playbook -i inventory.ini rename_unused_jdk.yml -l web01             # real run, one server first
+#   ansible-playbook -i inventory.ini rename_unused_jdk.yml                      # real run, all servers
+#   ... -e '{"jdk_dirs": ["/usr/java", "/opt"]}'      # folders that contain the jdk-* folders (default /usr/java)
+#   ... -e force=true       # FORCE: rename every jdk-* folder, EVEN IF it is in use (see "FORCE" below)
+#
+# Example:  /usr/java/jdk-17.0.5  ->  /usr/java/jdk-17.0.5-unused
+#
+# What is renamed:  real directories named jdk-* directly inside jdk_dirs.
+# Never touched:    names already ending in -unused, symlinks, and the plain "jdk" folder (no dash).
+#
+# SAFETY - a jdk-* folder is treated as IN USE (and is NOT renamed) if any of these point at it:
+#   1. a running process: its executable is under the folder, or its command line / environment (JAVA_HOME, PATH...) names it
+#   2. a symlink (e.g. /usr/bin/java, /etc/alternatives/*, /usr/lib/jvm/*, /usr/java/*) that resolves into it
+#   3. a configuration file that mentions its path: /etc/systemd/system, /etc/default, /etc/init.d, /etc/profile*,
+#      /etc/environment, /etc/sysconfig, cron files, and /data/wildfly (wrapper.conf, *.conf, *.sh, *.service ...)
+#   Config matches are conservative: a commented-out line still counts as "in use".
+#   NOT counted as "in use":
+#     - rotated / old log files (*.log, *.log.1, *.log.2, *.log-2026..., *.out, *.out.1): they only record a path that was
+#       used in the past (e.g. apminsight_agent_diagnostics_*.log.1)
+#     - a STALE /etc/alternatives link: it points into the folder but nothing points at the link (/usr/bin/java goes straight
+#       to /usr/java/jdk) and no config file names it. Shown as "(stale link ... ignored)" in the reason. After the rename
+#       that link is dangling and harmless; remove it if you like:  alternatives --remove java <old>/bin/java
+#       Disable this rule with -e ignore_stale_alternatives=false.
+#   Not detectable: scripts or cron jobs stored elsewhere that mention the path - check those yourself.
+#
+# FORCE (-e force=true): the in-use checks above are still run and shown, but the answer no longer matters - EVERY jdk-*
+#   folder is renamed to jdk-*-unused, used or not. Use it only when you know what you are doing:
+#     - a running java keeps working until it opens a file from the old folder, then it can fail; restart those services
+#     - symlinks into the folder (e.g. /etc/alternatives/java) and config files naming it (systemd units, wrapper.conf,
+#       /etc/default, cron ...) will point at a path that no longer exists until they are changed to /usr/java/jdk
+#   It never overwrites: a folder is skipped if jdk-*-unused already exists. Names already ending in -unused, symlinks and
+#   the plain "jdk" folder are still never touched. Try -e dry_run=true -e force=true first.
+#   In the report such folders show as "RENAMED (FORCED, was in use)".
+#
+# After the rename step, `systemctl daemon-reload` runs on every server (real run only; it re-reads unit files and
+#   restarts nothing). Servers without systemctl are skipped. Disable with:  -e daemon_reload=false
+# Undo: rename the folder back (mv <path>-unused <path>).
+# Output (control node, report_dir default ./java_rename_reports):  rename_report.csv  (host, path, decision, action, reason)
+
+- name: Rename unused jdk-* folders to jdk-*-unused
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    dry_run: false
+    force: false               # -e force=true: rename EVERY jdk-* folder even if it is in use (see FORCE in the header)
+    daemon_reload: true        # run `systemctl daemon-reload` on every server after the rename step (-e daemon_reload=false to skip)
+    jdk_dirs: ["/usr/java"]
+    ignore_stale_alternatives: true   # a /etc/alternatives link into the folder that nothing uses does not block the rename (-e ignore_stale_alternatives=false for the old strict behaviour)
+    ref_dirs:
+      - /etc/systemd/system
+      - /etc/default
+      - /etc/init.d
+      - /etc/profile
+      - /etc/profile.d
+      - /etc/environment
+      - /etc/sysconfig
+      - /etc/cron.d
+      - /etc/crontab
+      - /var/spool/cron
+      - /data/wildfly
+    report_dir: "{{ playbook_dir }}/java_rename_reports"
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+
+    scan_cmd: |
+      esc() { printf '%s' "$1" | sed 's/[][\.*^$()+?{}|\\]/\\&/g'; }
+      # alt_in_use LINK: true if another symlink points at LINK (e.g. /usr/bin/java -> /etc/alternatives/java)
+      #                  or a configuration file names LINK.
+      alt_in_use() {
+        for o in $(find /usr/bin /usr/sbin /usr/local/bin /usr/lib/jvm /usr/java -maxdepth 2 -type l 2>/dev/null); do
+          t1="$(readlink "$o" 2>/dev/null)"
+          case "$t1" in "$1"|*"$1") return 0;; esac
+        done
+        timeout 120 grep -rIsqF \
+          --exclude='*.log' --exclude='*.log.*' --exclude='*.log-*' --exclude='*.out' --exclude='*.out.*' \
+          --exclude-dir=logs --exclude-dir=log --exclude-dir=tmp --exclude-dir=data --exclude-dir=deployments --exclude-dir=.git \
+          -- "$1" $V_REFS 2>/dev/null && return 0
+        return 1
+      }
+      for base in $V_BASES; do
+        [ -d "$base" ] || continue
+        for c in "$base"/jdk-*; do
+          [ -d "$c" ] && [ ! -L "$c" ] || continue
+          case "$c" in *-unused) continue;; esac
+          ce="$(esc "$c")"
+          pat="${ce}(/|[[:space:]\"':;=]|\$)"
+          reasons=""; stale=""
+
+          # 1. running processes (executable, command line, environment)
+          pids=""; n=0
+          for p in /proc/[0-9]*; do
+            pid="${p#/proc/}"; [ "$pid" = "$$" ] && continue
+            e="$(readlink "$p/exe" 2>/dev/null)"
+            if [ "${e#"$c"/}" != "$e" ] \
+               || tr '\0' ' '  < "$p/cmdline" 2>/dev/null | grep -qE -- "$pat" \
+               || tr '\0' '\n' < "$p/environ" 2>/dev/null | grep -qE -- "$pat"; then
+              n=$((n+1)); [ "$n" -le 5 ] && pids="$pids $pid"
+            fi
+          done
+          [ "$n" -gt 0 ] && reasons="$reasons; $n running process(es), PIDs:$pids"
+
+          # 2. symlinks that resolve into it
+          #    A link in /etc/alternatives that NOTHING else points at (no /usr/bin/java -> /etc/alternatives/java, no config
+          #    file naming it) is STALE: it does not make the folder "in use" (ignore_stale_alternatives=true).
+          for l in $(find /usr/bin /usr/sbin /usr/local/bin /etc/alternatives /usr/lib/jvm "$base" -maxdepth 2 -type l 2>/dev/null); do
+            case "$l" in "$c"/*) continue;; esac
+            t="$(readlink -f "$l" 2>/dev/null)"
+            case "$t" in
+              "$c"|"$c"/*)
+                if [ "$V_STALE" = "true" ] && [ "${l#/etc/alternatives/}" != "$l" ] && ! alt_in_use "$l"; then
+                  stale="$stale; stale link $l -> $t (nothing points at it, ignored)"
+                else
+                  reasons="$reasons; symlink $l -> $t"
+                fi;;
+            esac
+          done
+
+          # 3. configuration files that mention the path (rotated logs such as *.log.1 / *.log.2 / *.log-2026* are not config)
+          files="$(timeout 120 grep -rIsl -E \
+                    --exclude='*.log' --exclude='*.log.*' --exclude='*.log-*' --exclude='*.out' --exclude='*.out.*' \
+                    --exclude-dir=logs --exclude-dir=log --exclude-dir=tmp \
+                    --exclude-dir=data --exclude-dir=deployments --exclude-dir=.git \
+                    -- "$pat" $V_REFS 2>/dev/null | head -5 | tr '\n' ' ')"
+          [ -n "$files" ] && reasons="$reasons; referenced in: $files"
+
+          if [ -z "$reasons" ]; then echo "CAND|$c|UNUSED|nothing references it${stale}"
+          else echo "CAND|$c|USED|${reasons#; }"; fi
+        done
+      done
+      exit 0
+
+  tasks:
+    - name: Scan for jdk-* folders and check whether each is in use (read-only)
+      ansible.builtin.shell: "{{ scan_cmd }}"
+      environment:
+        V_BASES: "{{ jdk_dirs | join(' ') }}"
+        V_REFS: "{{ ref_dirs | join(' ') }}"
+        V_STALE: "{{ ignore_stale_alternatives | bool | lower }}"
+      register: scan
+      changed_when: false
+      check_mode: false
+
+    - name: Sort the results
+      ansible.builtin.set_fact:
+        ren_cands: "{{ scan.stdout_lines | select('match', '^CAND[|]') | list }}"
+        ren_unused: "{{ scan.stdout_lines | select('match', '^CAND[|][^|]*[|]UNUSED[|]') | map('regex_replace', '^CAND[|]([^|]*)[|].*$', '\\1') | list }}"
+        ren_dry: "{{ is_dry | bool }}"
+        ren_force: "{{ force | bool }}"
+        # folders that will be renamed: only the unused ones, or every jdk-* folder with force=true
+        ren_todo: "{{ (scan.stdout_lines | select('match', '^CAND[|]') | map('regex_replace', '^CAND[|]([^|]*)[|].*$', '\\1') | list) if (force | bool) else (scan.stdout_lines | select('match', '^CAND[|][^|]*[|]UNUSED[|]') | map('regex_replace', '^CAND[|]([^|]*)[|].*$', '\\1') | list) }}"
+
+    - name: Show what was found
+      ansible.builtin.debug:
+        msg: >-
+          {{ (['DRY RUN - nothing is renamed'] if (is_dry | bool) else [])
+             + (['FORCE=true - every folder below is renamed, INCLUDING the ones marked USED (anything still using them will break until it points at /usr/java/jdk)'] if (force | bool) else [])
+             + (ren_cands | map('regex_replace', '^CAND[|]', '') | map('replace', '|', '  |  ', 2) | list
+                if (ren_cands | length) > 0 else ['no jdk-* folders found in ' ~ (jdk_dirs | join(', '))]) }}
+
+    - name: Rename the folders (only the unused ones, or all of them with force=true)
+      ansible.builtin.command: "mv {{ item }} {{ item }}-unused"
+      args:
+        removes: "{{ item }}"           # skip if the folder is already gone
+        creates: "{{ item }}-unused"    # skip if a -unused folder already exists (never overwrite)
+      loop: "{{ ren_todo }}"
+      register: rename_res
+      when: not (is_dry | bool)
+
+    - name: Remember which were renamed
+      ansible.builtin.set_fact:
+        ren_renamed: "{{ rename_res.results | default([]) | selectattr('changed', 'defined') | selectattr('changed') | map(attribute='item') | list }}"
+
+    # Runs on every server once the rename step above is finished (a reload only re-reads unit files, it restarts nothing).
+    # Skipped in a dry run, and with -e daemon_reload=false. Servers without systemd are skipped with a message.
+    - name: systemd daemon-reload (after the rename step)
+      ansible.builtin.shell: |
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl daemon-reload && echo "daemon-reload done"
+        else
+          echo "systemctl not found - daemon-reload skipped"
+        fi
+      register: dreload
+      changed_when: "'daemon-reload done' in dreload.stdout"
+      when: not (is_dry | bool) and (daemon_reload | bool)
+
+    - name: Result for this server
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ ((ren_todo | length) ~ ' folder(s) WOULD be renamed' ~ ((' (' ~ ((ren_todo | length) - (ren_unused | length)) ~ ' of them IN USE - forced)') if (force | bool) and ((ren_todo | length) - (ren_unused | length)) > 0 else '') ~ '; daemon-reload would run afterwards') if (is_dry | bool)
+             else ((ren_renamed | length) ~ ' renamed' ~ ((' (including in-use folders - forced)') if (force | bool) else '') ~ ', ' ~ ((ren_todo | length) - (ren_renamed | length)) ~ ' skipped (target exists), '
+                   ~ ((ren_cands | length) - (ren_todo | length)) ~ ' kept (in use); '
+                   ~ ((dreload.stdout | default('') | trim) if (daemon_reload | bool) else 'daemon-reload disabled (daemon_reload=false)')) }}
+
+- name: Rename report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dry_run: false
+    report_dir: "{{ playbook_dir }}/java_rename_reports"
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+  tasks:
+    - name: Create the report folder
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      when: not (is_dry | bool)
+
+    - name: Write rename_report.csv
+      ansible.builtin.copy:
+        content: |
+          host,path,decision,action,reason
+          {% for h in groups['all'] if hostvars[h].ren_cands is defined %}
+          {% for c in hostvars[h].ren_cands %}
+          {% set f = c.split('|') %}
+          {{ h }},{{ f[1] }},{{ f[2] }},{{ 'KEPT (in use)' if (f[2] == 'USED' and not hostvars[h].ren_force) else (('WOULD RENAME' if hostvars[h].ren_dry else ('RENAMED' if f[1] in hostvars[h].ren_renamed else 'SKIPPED (target -unused exists)')) ~ (' (FORCED, was in use)' if (f[2] == 'USED' and hostvars[h].ren_force) else '')) }},{{ f[3] | replace(',', ' ') }}
+          {% endfor %}
+          {% endfor %}
+        dest: "{{ report_dir }}/rename_report.csv"
+        mode: "0644"
+      when: not (is_dry | bool)

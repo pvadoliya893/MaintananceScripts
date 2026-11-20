@@ -1,0 +1,654 @@
+---
+# verify_java.yml - READ-ONLY verification that the JDK deployed by deploy_java.yml is in place and in use.
+# Changes nothing on the servers. Only writes reports on the control node.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini verify_java.yml
+#   ansible-playbook -i inventory.ini verify_java.yml -l web01
+#   ansible-playbook -i inventory.ini verify_java.yml -e dry_run=true     # DRY RUN (same as --check): checks run and are shown on
+#                                                                         # screen, but no report file is written on the control node
+#   ansible-playbook -i inventory.ini verify_java.yml -e strict=true      # hosts with a FAIL are marked failed (exit code != 0)
+#   ansible-playbook -i inventory.ini verify_java.yml -e target_version=21.0.14 -e java_dest=/usr/java/jdk
+#
+# Checks per server (each shows PASS / WARN / FAIL):
+#   1. JDK present          java_dest/bin/java exists and is executable
+#   2. Installed version    java.version of java_dest/bin/java equals target_version (build + vendor shown)
+#   3. javac present        a JDK, not only a JRE
+#   4. Ownership/permission java_dest owned by root and nothing world-writable near the top
+#   5. java on PATH         the java a shell finds reports target_version
+#   6. Symlinks             /usr/bin/java and /usr/bin/javac resolve to the target (or PATH java already is the target)
+#   7. Running java         every running java process uses a java reporting target_version (else: restart needed)
+#
+#   8. cacerts file         java_dest/lib/security/cacerts has the same sha256 as the file on the control node (cacerts_src)
+#                           (-e check_cacerts=false to skip)
+#   9. Config files updated none of the files replace_jdk_paths.yml edits (systemd, /etc/default, init.d, asitemicroapps,
+#                           wildfly service_*) still points at an old jdk-* path -> FAIL with file, line and text
+#  10. Manual review        lines that mention jdk- in a form the replace playbook does not change -> WARN with file and line
+#  11. Files use new JDK    at least one scanned file references java_dest (WARN if none)
+#                           (-e check_files=false to skip checks 9-11)
+#  12-18. Files changed by replace_jdk_paths.yml, taken from ITS OWN BACKUPS (/var/backups/jdk_path_replace/<time>/<path>),
+#                           so exactly the files it modified are checked (-e check_modified=false to skip):
+#   12. Modified files recorded   how many files / replace runs the backups hold
+#   13. Modified files present    every changed file still exists and is readable
+#   14. Old path gone             no changed file still contains an old jdk-* path (shows the line)
+#   15. Content                   changed file == its backup with ONLY the jdk path replaced (nothing else touched)
+#   16. Permissions               mode and owner equal to the backup
+#   17. systemd reload            changed unit files do not need a daemon-reload (systemctl show NeedDaemonReload)
+#   18. Replace report cross-check every file replace_report.csv (control node) lists as REPLACED for the server was verified
+#                           Each verified file is also listed in the report as [verified] <path>.
+#
+# Overall per server: PASS (all pass) / WARN (no FAIL, some WARN) / FAIL (at least one FAIL).
+# Output (control node, report_dir default ./java_verify_reports):
+#   <host>_verify.txt       detail per server
+#   java_verify_summary.csv one row per server (unreachable servers are listed as NOT CHECKED)
+
+- name: Verify Java deployment
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    java_dest: /usr/java/jdk
+    target_version: "21.0.13.1"
+    java_links:
+      - { name: java,  link: /usr/bin/java }
+      - { name: javac, link: /usr/bin/javac }
+    strict: false
+    dry_run: false
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+    report_dir: "{{ playbook_dir }}/java_verify_reports"
+
+    # ---- cacerts (pushed by deploy_java.yml from the control node) ----
+    check_cacerts: true        # -e check_cacerts=false to skip
+    cacerts_src: /usr/java/jdk-21.0.1/lib/security/cacerts     # path on the CONTROL NODE (same as deploy_java.yml)
+    cacerts_dest: "{{ java_dest }}/lib/security/cacerts"
+
+    # ---- config files edited by replace_jdk_paths.yml (keep scan_targets / jdk_path_regex / scan_py identical to that file) ----
+    check_files: true          # -e check_files=false to skip
+    scan_targets:
+      - { path: /etc/systemd/system, patterns: "*",    recurse: true }
+      - { path: /etc/default,        patterns: "*",    recurse: false }
+      - { path: /etc/init.d,         patterns: "*",    recurse: false }
+      - { path: /data/asitemicroapps, patterns: "*.sh", recurse: true }
+      - { path: /data/wildfly/bin, patterns: ["*.conf", "*.sh"], recurse: true, only: "^/data/wildfly/bin/service_[^/]+/" }
+
+    jdk_path_regex: |-
+      (?:(?<=[\s=:;"'(])|^)/(?:[^\s:;"'=$]*/)?jdk-[^/\s:;"'$]*(?<!-unused)(?=[/\s:;"')]|$)
+
+    py_bin: "{{ ansible_python_interpreter | default(ansible_facts['discovered_interpreter_python'] | default('python3')) }}"
+
+    scan_py: |
+      import os, re, sys
+
+      def emit(s):
+          if sys.version_info[0] >= 3:
+              sys.stdout.write(s + "\n")
+          else:
+              sys.stdout.write(s.encode("utf-8") + "\n")
+
+      pat = re.compile(os.environ["V_PAT"])
+      for f in os.environ.get("V_FILES", "").split("\n"):
+          if not f or not os.path.isfile(f):
+              continue
+          try:
+              fh = open(f, "rb")
+              data = fh.read()
+              fh.close()
+          except Exception:
+              continue
+          if b"\0" in data:
+              continue
+          text = data.decode("utf-8", "replace")
+          name = f
+          if sys.version_info[0] < 3:
+              name = f.decode("utf-8", "replace")
+          n = 0
+          for line in text.split("\n"):
+              n += 1
+              line = line.rstrip("\r")
+              if "jdk-" not in line:
+                  continue
+              kind = "REPLACE" if pat.search(line) else "REVIEW"
+              emit(u"%s|%s|%d|%s" % (kind, name, n, line))
+
+    verify_cmd: |
+      DEST="$V_DEST"; TARGET="$V_TARGET"
+      chk()  { echo "CHECK|$1|$2|$3"; }
+      meta() { echo "META|$1|$2"; }
+      getver()    { "$1" -XshowSettings:properties -version 2>&1 </dev/null | awk -F'= ' '/ java.version =/{print $2; exit}'; }
+      getbuild()  { "$1" -XshowSettings:properties -version 2>&1 </dev/null | awk -F'= ' '/ java.runtime.version =/{print $2; exit}'; }
+      getvendor() { "$1" -XshowSettings:properties -version 2>&1 </dev/null | awk -F'= ' '/ java.vendor =/{print $2; exit}'; }
+      linkver() { # $1=name $2=path
+        if [ "$1" = "java" ]; then getver "$2"; else "$2" -version 2>&1 </dev/null | awk 'NR==1{print $2}'; fi
+      }
+
+      # 1-2. installed JDK
+      inst=""
+      if [ -x "$DEST/bin/java" ]; then
+        inst="$(getver "$DEST/bin/java")"; ib="$(getbuild "$DEST/bin/java")"; iv="$(getvendor "$DEST/bin/java")"
+        chk "JDK present" PASS "$DEST/bin/java"
+        if [ "$inst" = "$TARGET" ]; then chk "Installed version" PASS "$inst (build ${ib:-?}, ${iv:-?})"
+        else chk "Installed version" FAIL "found '${inst:-unreadable}', expected $TARGET"; fi
+      else
+        chk "JDK present" FAIL "$DEST/bin/java missing or not executable"
+        chk "Installed version" FAIL "cannot check"
+      fi
+      meta installed "${inst:-none}"
+
+      # 3. javac
+      if [ -x "$DEST/bin/javac" ]; then chk "javac present" PASS "$("$DEST/bin/javac" -version 2>&1 | head -1)"
+      else chk "javac present" WARN "no javac in $DEST/bin (JRE only?)"; fi
+
+      # 4. ownership / permissions
+      if [ -d "$DEST" ]; then
+        own="$(stat -c %U:%G "$DEST" 2>/dev/null)"
+        ww="$(find "$DEST" -maxdepth 2 -perm -0002 ! -type l 2>/dev/null | head -1)"
+        if [ "$own" = "root:root" ] && [ -z "$ww" ]; then chk "Ownership/permissions" PASS "$own, nothing world-writable"
+        else chk "Ownership/permissions" WARN "owner $own${ww:+, world-writable: $ww}"; fi
+      fi
+
+      # 5. java on PATH
+      J="$(command -v java 2>/dev/null)"; pv=""
+      if [ -z "$J" ]; then chk "java on PATH" FAIL "java not found on PATH"
+      else
+        pv="$(getver "$J")"; rj="$(readlink -f "$J")"
+        if [ "$pv" = "$TARGET" ]; then chk "java on PATH" PASS "$J -> $rj ($pv)"
+        else chk "java on PATH" FAIL "$J -> $rj shows '${pv:-unknown}', expected $TARGET"; fi
+      fi
+      meta path_version "${pv:-none}"
+
+      # 6. symlinks (format name:link)
+      for pair in $V_LINKS; do
+        name="${pair%%:*}"; link="${pair#*:}"
+        [ "$name" = "javac" ] && [ ! -x "$DEST/bin/javac" ] && continue
+        if [ -L "$link" ]; then
+          rl="$(readlink -f "$link")"; lv=""; [ -x "$rl" ] && lv="$(linkver "$name" "$rl")"
+          case "$rl" in
+            "$DEST"/*) chk "Symlink $link" PASS "-> $rl" ;;
+            *) if [ "$lv" = "$TARGET" ]; then chk "Symlink $link" PASS "-> $rl (outside $DEST but shows $lv)"
+               elif [ "$pv" = "$TARGET" ]; then chk "Symlink $link" WARN "-> $rl shows '${lv:-unknown}'; PATH java is already the target"
+               else chk "Symlink $link" FAIL "-> $rl shows '${lv:-unknown}', expected $TARGET"; fi ;;
+          esac
+        elif [ -e "$link" ]; then
+          lv="$(linkver "$name" "$link")"
+          if [ "$pv" = "$TARGET" ]; then chk "Symlink $link" WARN "real file, not a symlink (shows '${lv:-unknown}'); PATH java is the target"
+          else chk "Symlink $link" FAIL "real file, not a symlink, shows '${lv:-unknown}'"; fi
+        else
+          if [ "$pv" = "$TARGET" ]; then chk "Symlink $link" WARN "does not exist (PATH java already shows the target, link not needed)"
+          else chk "Symlink $link" FAIL "does not exist"; fi
+        fi
+      done
+
+      # 7. running java processes
+      procs="$(ps -eo pid=,user=,comm=,args= 2>/dev/null | { declare -A seen; while read -r pid user comm rest; do
+          [ "$comm" = "java" ] || continue
+          exe="$(readlink -f /proc/$pid/exe 2>/dev/null)"; [ -n "$exe" ] || exe="unknown"
+          if [ -z "${seen[$exe]+x}" ]; then if [ -x "$exe" ]; then seen[$exe]="$(getver "$exe")"; else seen[$exe]=""; fi; fi
+          echo "PROC|$pid|$user|$exe|${seen[$exe]:-unknown}|${rest:0:120}"
+        done; })"
+      total="$(echo "$procs" | grep -c '^PROC|')"
+      off="$(echo "$procs" | grep '^PROC|' | awk -F'|' -v t="$TARGET" '$5 != t' | wc -l)"
+      if [ "$total" -eq 0 ]; then chk "Running java processes" PASS "none running"
+      elif [ "$off" -eq 0 ]; then chk "Running java processes" PASS "$total running, all on $TARGET"
+      else
+        chk "Running java processes" WARN "$off of $total NOT on $TARGET - restart needed"
+        echo "$procs" | grep '^PROC|' | awk -F'|' -v t="$TARGET" '$5 != t {print "DETAIL|PID " $2 " (" $3 ") " $4 " = " $5 "  |  " $6}' | head -20
+      fi
+      meta procs_total "$total"; meta procs_off "$off"
+      exit 0
+
+    # ---- files modified by replace_jdk_paths.yml: its backups (backup_root/<timestamp>/<original path>) list exactly what it changed ----
+    check_modified: true       # -e check_modified=false to skip checks 12-18
+    backup_root: /var/backups/jdk_path_replace                 # same as replace_jdk_paths.yml
+    replace_report: "{{ playbook_dir }}/java_replace_reports/replace_report.csv"   # written by a real run of replace_jdk_paths.yml
+
+    # Read-only. For every backed-up file: still there? no old jdk-* path left? content == backup with only the path replaced?
+    # same mode/owner as the backup? Also asks systemd whether changed unit files still need a daemon-reload.
+    modified_py: |
+      import os, re, sys, subprocess
+
+      def u(s):
+          if sys.version_info[0] < 3 and isinstance(s, str):
+              return s.decode("utf-8", "replace")
+          return s
+
+      def emit(s):
+          if sys.version_info[0] >= 3:
+              sys.stdout.write(s + "\n")
+          else:
+              sys.stdout.write(s.encode("utf-8") + "\n")
+
+      def rd(p):
+          fh = open(p, "rb")
+          d = fh.read()
+          fh.close()
+          return d.decode("utf-8", "replace")
+
+      root = os.environ["V_ROOT"]
+      dest = os.environ["V_DEST"]
+      pat = re.compile(os.environ["V_PAT"], re.MULTILINE)
+
+      if not os.path.isdir(root):
+          emit(u"NOBACKUP")
+          sys.exit(0)
+
+      runs = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+      orig = {}
+      for r in runs:
+          base = os.path.join(root, r)
+          for dp, dn, fn in os.walk(base):
+              for f in fn:
+                  b = os.path.join(dp, f)
+                  o = b[len(base):]
+                  if o not in orig:
+                      orig[o] = b
+
+      emit(u"RUNS|%d|%d" % (len(runs), len(orig)))
+      units = {}
+      sd = "/etc/systemd/system/"
+      for o in sorted(orig):
+          b = orig[o]
+          uo = u(o)
+          if not os.path.isfile(o):
+              emit(u"FILE|MISSING|%s|" % uo)
+              continue
+          try:
+              cur = rd(o)
+              old = rd(b)
+          except Exception:
+              emit(u"FILE|UNREADABLE|%s|" % uo)
+              continue
+          bad = False
+          m = pat.search(cur)
+          if m:
+              bad = True
+              ln = cur[:m.start()].count("\n") + 1
+              emit(u"FILE|STILL_OLD|%s|line %d: %s" % (uo, ln, cur.split("\n")[ln - 1].strip()))
+          elif cur != pat.sub(lambda mm: dest, old):
+              bad = True
+              emit(u"FILE|DIFF|%s|" % uo)
+          st = os.stat(o)
+          sb = os.stat(b)
+          if (st.st_mode & 4095) != (sb.st_mode & 4095) or st.st_uid != sb.st_uid or st.st_gid != sb.st_gid:
+              bad = True
+              emit(u"FILE|MODE|%s|now %o %d:%d, backup %o %d:%d" % (uo, st.st_mode & 4095, st.st_uid, st.st_gid, sb.st_mode & 4095, sb.st_uid, sb.st_gid))
+          if not bad:
+              emit(u"FILE|OK|%s|" % uo)
+          if o.startswith(sd):
+              first = o[len(sd):].split("/")[0]
+              if first.endswith(".d"):
+                  first = first[:-2]
+              if re.search(r"[.](service|socket|timer|path|mount|target)$", first):
+                  units[first] = 1
+
+      for un in sorted(units):
+          try:
+              p = subprocess.Popen(["systemctl", "show", "-p", "NeedDaemonReload", un], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              out = p.communicate()[0].decode("utf-8", "replace")
+              if "NeedDaemonReload=yes" in out:
+                  res = "yes"
+              elif "NeedDaemonReload=no" in out:
+                  res = "no"
+              else:
+                  res = "unknown"
+          except Exception:
+              res = "unknown"
+          emit(u"UNIT|%s|%s" % (u(un), res))
+
+  tasks:
+    - name: DRY RUN - what will and will not happen
+      ansible.builtin.debug:
+        msg:
+          - "DRY RUN - the checks below still run (they are read-only) and are shown on screen"
+          - "NOT written: {{ report_dir }}/<host>_verify.txt and java_verify_summary.csv"
+      run_once: true
+      when: is_dry | bool
+
+    - name: Run the verification checks (read-only)
+      ansible.builtin.shell: "{{ verify_cmd }}"
+      environment:
+        V_DEST: "{{ java_dest }}"
+        V_TARGET: "{{ target_version }}"
+        V_LINKS: "{{ java_links | map(attribute='name') | zip(java_links | map(attribute='link')) | map('join', ':') | join(' ') }}"
+      register: vout
+      changed_when: false
+      check_mode: false
+
+    # ---------- cacerts: same file as on the control node? (read-only) ----------
+    - name: Checksum of the cacerts file on the control node
+      ansible.builtin.stat:
+        path: "{{ cacerts_src }}"
+        checksum_algorithm: sha256
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: cacerts_ctl
+      check_mode: false
+      when: check_cacerts | bool
+
+    - name: Checksum of the cacerts file on the server
+      ansible.builtin.stat:
+        path: "{{ cacerts_dest }}"
+        checksum_algorithm: sha256
+      register: cacerts_srv
+      check_mode: false
+      when: check_cacerts | bool
+
+    # ---------- config files: nothing may still point at an old jdk-* path (read-only) ----------
+    - name: Find files that mention jdk-
+      ansible.builtin.find:
+        paths: "{{ item.path }}"
+        patterns: "{{ item.patterns }}"
+        recurse: "{{ item.recurse }}"
+        file_type: file
+        contains: ".*jdk-"
+        follow: false
+      loop: "{{ scan_targets }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: found_v
+      check_mode: false
+      when: check_files | bool
+
+    - name: Find files that already point at the new JDK
+      ansible.builtin.find:
+        paths: "{{ item.path }}"
+        patterns: "{{ item.patterns }}"
+        recurse: "{{ item.recurse }}"
+        file_type: file
+        contains: ".*{{ java_dest }}([^-A-Za-z0-9_.]|$)"
+        follow: false
+      loop: "{{ scan_targets }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: found_new
+      check_mode: false
+      when: check_files | bool
+
+    - name: List the candidate files
+      ansible.builtin.set_fact:
+        cand_files_v: >-
+          {%- set out = [] -%}
+          {%- for r in found_v.results -%}
+          {%- for f in r.files -%}
+          {%- if (r.item.only is not defined) or (f.path is match(r.item.only)) -%}
+          {%- if out.append(f.path) -%}{%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out | unique | sort | list }}
+      when: check_files | bool
+
+    - name: Scan the files for jdk-* references
+      ansible.builtin.command:
+        argv: ["{{ py_bin }}", "-"]
+        stdin: "{{ scan_py }}"
+      environment:
+        V_FILES: "{{ cand_files_v | join('\n') }}"
+        V_PAT: "{{ jdk_path_regex }}"
+      register: scan_v
+      changed_when: false
+      check_mode: false
+      when: check_files | bool
+
+    - name: Build the cacerts and file check lines
+      ansible.builtin.set_fact:
+        extra_lines: >-
+          {%- set out = [] -%}
+          {%- if check_cacerts | bool -%}
+          {%- if not cacerts_ctl.stat.exists -%}
+          {%- set _ = out.append('CHECK|cacerts file|WARN|' ~ cacerts_src ~ ' not found on the control node - cannot compare') -%}
+          {%- elif not cacerts_srv.stat.exists -%}
+          {%- set _ = out.append('CHECK|cacerts file|FAIL|' ~ cacerts_dest ~ ' is missing') -%}
+          {%- elif cacerts_srv.stat.checksum == cacerts_ctl.stat.checksum -%}
+          {%- set _ = out.append('CHECK|cacerts file|PASS|' ~ cacerts_dest ~ ' is identical to the control node copy (sha256 ' ~ cacerts_srv.stat.checksum[:12] ~ '...)') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|cacerts file|FAIL|' ~ cacerts_dest ~ ' differs from the control node copy (not copied, or changed since)') -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- if check_files | bool -%}
+          {%- set rep = scan_v.stdout_lines | select('match', '^REPLACE[|]') | list -%}
+          {%- set rev = scan_v.stdout_lines | select('match', '^REVIEW[|]') | list -%}
+          {%- set repf = rep | map('regex_replace', '^REPLACE[|]([^|]*)[|].*$', '\\1') | unique | list -%}
+          {%- set newf = found_new.results | map(attribute='files') | map('length') | sum -%}
+          {%- if rep | length == 0 -%}
+          {%- set _ = out.append('CHECK|Config files updated|PASS|no file still points at an old jdk-* path (' ~ (cand_files_v | length) ~ ' file(s) mention jdk-)') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Config files updated|FAIL|' ~ (rep | length) ~ ' line(s) in ' ~ (repf | length) ~ ' file(s) still point at an old jdk-* path - run replace_jdk_paths.yml') -%}
+          {%- for x in rep[:20] -%}
+          {%- set f = x.split('|', 3) -%}
+          {%- set _ = out.append('DETAIL|[to replace] ' ~ f[1] ~ ' line ' ~ f[2] ~ ' = ' ~ (f[3] | trim)) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- if rev | length == 0 -%}
+          {%- set _ = out.append('CHECK|Config files manual review|PASS|no jdk-* line needs manual review') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Config files manual review|WARN|' ~ (rev | length) ~ ' line(s) mention jdk- in a form the playbook does not change - edit by hand') -%}
+          {%- for x in rev[:20] -%}
+          {%- set f = x.split('|', 3) -%}
+          {%- set _ = out.append('DETAIL|[manual] ' ~ f[1] ~ ' line ' ~ f[2] ~ ' = ' ~ (f[3] | trim)) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- if newf | int > 0 -%}
+          {%- set _ = out.append('CHECK|Config files use new JDK|PASS|' ~ newf ~ ' file(s) reference ' ~ java_dest) -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Config files use new JDK|WARN|no scanned file references ' ~ java_dest) -%}
+          {%- endif -%}
+          {%- endif -%}
+          {{ out }}
+
+    # ---------- files modified by replace_jdk_paths.yml: verified from its own backups (read-only) ----------
+    - name: Check every file that replace_jdk_paths.yml backed up and changed
+      ansible.builtin.command:
+        argv: ["{{ py_bin }}", "-"]
+        stdin: "{{ modified_py }}"
+      environment:
+        V_ROOT: "{{ backup_root }}"
+        V_DEST: "{{ java_dest }}"
+        V_PAT: "{{ jdk_path_regex }}"
+      register: mod_v
+      changed_when: false
+      check_mode: false
+      when: check_modified | bool
+
+    - name: Read the replace report from the control node (if a real run wrote one)
+      ansible.builtin.slurp:
+        src: "{{ replace_report }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: rep_csv
+      failed_when: false
+      check_mode: false
+      when: check_modified | bool
+
+    - name: Build the modified-files check lines
+      ansible.builtin.set_fact:
+        mod_lines: >-
+          {%- set out = [] -%}
+          {%- if check_modified | bool -%}
+          {%- set L = mod_v.stdout_lines -%}
+          {%- if 'NOBACKUP' in L -%}
+          {%- set _ = out.append('CHECK|Modified files recorded|WARN|no backup folder ' ~ backup_root ~ ' on this server - replace_jdk_paths.yml has not changed anything here (checks 9-10 still scan for leftovers)') -%}
+          {%- else -%}
+          {%- set rl = (L | select('match', '^RUNS[|]') | list | first).split('|') -%}
+          {%- set fl = L | select('match', '^FILE[|]') | list -%}
+          {%- set f_miss = fl | select('match', '^FILE[|](MISSING|UNREADABLE)[|]') | list -%}
+          {%- set f_old = fl | select('match', '^FILE[|]STILL_OLD[|]') | list -%}
+          {%- set f_dif = fl | select('match', '^FILE[|]DIFF[|]') | list -%}
+          {%- set f_mode = fl | select('match', '^FILE[|]MODE[|]') | list -%}
+          {%- set f_ok = fl | select('match', '^FILE[|]OK[|]') | list -%}
+          {%- set u_all = L | select('match', '^UNIT[|]') | list -%}
+          {%- set u_yes = L | select('match', '^UNIT[|][^|]*[|]yes$') | list -%}
+          {%- if (rl[2] | int) == 0 -%}
+          {%- set _ = out.append('CHECK|Modified files recorded|WARN|backup folder ' ~ backup_root ~ ' exists but holds no files') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Modified files recorded|PASS|' ~ rl[2] ~ ' file(s) changed by ' ~ rl[1] ~ ' replace run(s) found in ' ~ backup_root) -%}
+          {%- endif -%}
+          {%- if f_miss | length == 0 -%}
+          {%- set _ = out.append('CHECK|Modified files present|PASS|every changed file still exists and is readable') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Modified files present|FAIL|' ~ (f_miss | length) ~ ' changed file(s) are missing or unreadable') -%}
+          {%- for x in f_miss[:20] -%}
+          {%- set _ = out.append('DETAIL|[missing] ' ~ x.split('|', 3)[2]) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- if f_old | length == 0 -%}
+          {%- set _ = out.append('CHECK|Modified files old path gone|PASS|no changed file contains an old jdk-* path') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Modified files old path gone|FAIL|' ~ (f_old | length) ~ ' changed file(s) still contain an old jdk-* path') -%}
+          {%- for x in f_old[:20] -%}
+          {%- set _ = out.append('DETAIL|[old path] ' ~ x.split('|', 3)[2] ~ ' ' ~ x.split('|', 3)[3]) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- if f_dif | length == 0 -%}
+          {%- set _ = out.append('CHECK|Modified files content|PASS|each changed file equals its backup with only the jdk path replaced') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Modified files content|WARN|' ~ (f_dif | length) ~ ' changed file(s) differ from backup + expected replacement (edited since, or other changes)') -%}
+          {%- for x in f_dif[:20] -%}
+          {%- set _ = out.append('DETAIL|[content differs] ' ~ x.split('|', 3)[2]) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- if f_mode | length == 0 -%}
+          {%- set _ = out.append('CHECK|Modified files permissions|PASS|mode and owner of every changed file match its backup') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Modified files permissions|WARN|' ~ (f_mode | length) ~ ' changed file(s) have a different mode or owner than their backup') -%}
+          {%- for x in f_mode[:20] -%}
+          {%- set _ = out.append('DETAIL|[mode/owner] ' ~ x.split('|', 3)[2] ~ ' ' ~ x.split('|', 3)[3]) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- if u_all | length == 0 -%}
+          {%- set _ = out.append('CHECK|systemd reload|PASS|no changed systemd unit to check') -%}
+          {%- elif u_yes | length == 0 -%}
+          {%- set _ = out.append('CHECK|systemd reload|PASS|' ~ (u_all | length) ~ ' changed unit(s) checked, none needs a daemon-reload') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|systemd reload|FAIL|' ~ (u_yes | length) ~ ' unit file(s) changed on disk but systemctl daemon-reload was not run') -%}
+          {%- for x in u_yes -%}
+          {%- set _ = out.append('DETAIL|[needs daemon-reload] ' ~ x.split('|')[1]) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- for x in f_ok[:100] -%}
+          {%- set _ = out.append('DETAIL|[verified] ' ~ x.split('|', 3)[2]) -%}
+          {%- endfor -%}
+          {%- if (rep_csv is defined) and not (rep_csv.failed | default(false)) and (rep_csv.content is defined) -%}
+          {%- set exp = [] -%}
+          {%- for r in (rep_csv.content | b64decode).split('\n') -%}
+          {%- set c = r.split(',', 5) -%}
+          {%- if (c | length) > 5 and c[0] == inventory_hostname and c[4] == 'REPLACED' and c[2] not in exp -%}
+          {%- set _ = exp.append(c[2]) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- set seen = [] -%}
+          {%- for x in fl -%}
+          {%- set _ = seen.append(x.split('|', 3)[2]) -%}
+          {%- endfor -%}
+          {%- set lost = [] -%}
+          {%- for p in exp -%}
+          {%- if p not in seen -%}
+          {%- set _ = lost.append(p) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- if lost | length == 0 -%}
+          {%- set _ = out.append('CHECK|Replace report cross-check|PASS|all ' ~ (exp | length) ~ ' file(s) the replace report lists as REPLACED for this server were verified above') -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Replace report cross-check|FAIL|' ~ (lost | length) ~ ' file(s) listed as REPLACED in the replace report have no backup on this server') -%}
+          {%- for p in lost[:20] -%}
+          {%- set _ = out.append('DETAIL|[not in backup] ' ~ p) -%}
+          {%- endfor -%}
+          {%- endif -%}
+          {%- else -%}
+          {%- set _ = out.append('CHECK|Replace report cross-check|WARN|' ~ replace_report ~ ' not found (no real run yet, or another report_dir) - cross-check skipped') -%}
+          {%- endif -%}
+          {%- endif -%}
+          {%- endif -%}
+          {{ out }}
+
+    - name: Work out the result for this server
+      ansible.builtin.set_fact:
+        v_checks: "{{ (vout.stdout_lines + extra_lines + mod_lines) | select('match', '^CHECK[|]') | map('regex_replace', '^CHECK[|]([^|]*)[|]([^|]*)[|](.*)$', '[\\2] \\1 : \\3') | list }}"
+        v_details: "{{ (vout.stdout_lines + extra_lines + mod_lines) | select('match', '^DETAIL[|]') | map('regex_replace', '^DETAIL[|]', '      - ') | list }}"
+        v_fails: "{{ (vout.stdout_lines + extra_lines + mod_lines) | select('match', '^CHECK[|][^|]*[|]FAIL[|]') | list | length }}"
+        v_warns: "{{ (vout.stdout_lines + extra_lines + mod_lines) | select('match', '^CHECK[|][^|]*[|]WARN[|]') | list | length }}"
+        v_installed: "{{ vout.stdout | regex_search('META[|]installed[|](\\S*)', '\\1') | default(['?'], true) | first }}"
+        v_pathver: "{{ vout.stdout | regex_search('META[|]path_version[|](\\S*)', '\\1') | default(['?'], true) | first }}"
+        v_ptotal: "{{ vout.stdout | regex_search('META[|]procs_total[|](\\d+)', '\\1') | default(['0'], true) | first }}"
+        v_poff: "{{ vout.stdout | regex_search('META[|]procs_off[|](\\d+)', '\\1') | default(['0'], true) | first }}"
+
+    - name: Set the overall status
+      ansible.builtin.set_fact:
+        v_overall: "{{ 'FAIL' if (v_fails | int) > 0 else ('WARN' if (v_warns | int) > 0 else 'PASS') }}"
+
+    - name: Build the report text and summary row
+      ansible.builtin.set_fact:
+        v_text: |
+          ===== {{ inventory_hostname }} : {{ v_overall }}  (target {{ target_version }}, {{ java_dest }}) =====
+          {{ v_checks | join('\n') }}
+          {% if v_details | length > 0 %}
+          Details (processes not on {{ target_version }}, files to fix, files verified):
+          {{ v_details | join('\n') }}
+          {% endif %}
+        verify_row: "{{ inventory_hostname }},{{ v_overall }},{{ v_fails }},{{ v_warns }},{{ v_installed }},{{ v_pathver }},{{ v_ptotal }},{{ v_poff }}"
+
+    - name: Show the result
+      ansible.builtin.debug:
+        msg: "{{ v_text.split('\n') }}"
+
+    - name: Create the report folder on the control node
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: not (is_dry | bool)
+
+    - name: Save the report on the control node
+      ansible.builtin.copy:
+        content: "{{ v_text }}"
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_verify.txt"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      when: not (is_dry | bool)
+
+    - name: strict mode - mark servers with a FAIL as failed
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }} FAILED verification: {{ v_fails }} failed check(s)"
+      when: (strict | bool) and (v_fails | int) > 0
+
+- name: Verification summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dry_run: false
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+    report_dir: "{{ playbook_dir }}/java_verify_reports"
+  tasks:
+    - name: Create the report folder
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      when: not (is_dry | bool)
+
+    - name: Write java_verify_summary.csv
+      ansible.builtin.copy:
+        content: |
+          host,overall,failed_checks,warnings,installed_version,path_java_version,java_processes,processes_not_on_target
+          {% for h in groups['all'] %}
+          {% if hostvars[h].verify_row is defined %}
+          {{ hostvars[h].verify_row }}
+          {% else %}
+          {{ h }},NOT CHECKED (unreachable or failed early),,,,,,
+          {% endif %}
+          {% endfor %}
+        dest: "{{ report_dir }}/java_verify_summary.csv"
+        mode: "0644"
+      when: not (is_dry | bool)
+
+    - name: Show the summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ ['host,overall,failed_checks,warnings,installed_version,path_java_version,java_processes,processes_not_on_target']
+             + (groups['all'] | map('extract', hostvars, 'verify_row') | select('defined') | list) }}

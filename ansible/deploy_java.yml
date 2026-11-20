@@ -1,0 +1,554 @@
+---
+# deploy_java.yml - Download Amazon Corretto ONCE, copy the .tar.gz to each Linux server, and do the rest ON each
+# server (extract, copy to /usr/java/jdk, link where needed, verify, report). Servers work in parallel.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini deploy_java.yml -e dry_run=true       # DRY RUN: shows the plan, changes nothing
+#   ansible-playbook -i inventory.ini deploy_java.yml --check               # same as dry_run=true
+#   ansible-playbook -i inventory.ini deploy_java.yml -l web01              # real run, one server first
+#   ansible-playbook -i inventory.ini deploy_java.yml                       # real run, all servers
+#   ansible-playbook -i inventory.ini deploy_java.yml -f 20                 # 20 servers in parallel (default is 5)
+#   ... -e java_url=https://corretto.aws/downloads/resources/<ver>/amazon-corretto-<ver>-linux-x64.tar.gz
+#   ... -e java_sha256=<checksum>      # verify the download (recommended)
+#   ... -e java_src=/path/to/jdk.tar.gz          # use a local .tar.gz instead of downloading
+#   ... -e force=true                  # replace an existing, non-empty /usr/java/jdk (old one is renamed to a backup)
+#   ... -e download_dir=/data/stuff/punit        # download / staging folder, on the control node AND on the servers
+#   ... -e keep_staging=false          # delete the .tar.gz and extracted jdk/ from the servers when finished
+#
+# SYMLINKS: NOT created unless you ask for them:   -e create_symlink=true
+#   Without that argument the JDK is only deployed to /usr/java/jdk and no symlink is touched.
+#   With it, /usr/bin/java and /usr/bin/javac are linked to /usr/java/jdk/bin/..., but ONLY on servers where java does not
+#   already report java.version equal to target_version (default 21.0.13.1; build/vendor text such as 21.0.13.1+2-LTS or
+#   Corretto-21.0.13.1.2 does not matter). If you change java_url to another version, also change target_version
+#   (-e target_version=<new version>).
+#   ansible-playbook -i inventory.ini deploy_java.yml -e create_symlink=true
+#
+# DRY RUN (dry_run=true or --check): nothing is downloaded, created, copied, extracted, linked or written anywhere.
+#   Read-only checks still run, so you see per server the current java, the available versions, what is already
+#   staged on the server, whether the symlinks would be created or skipped, and a plan of every step.
+#
+# Real run, on the control node (once):
+#     1. Creates /data/stuff/punit if it does not exist and downloads the .tar.gz there (re-used on later runs)
+# Real run, ON EACH SERVER (in parallel):
+#     2. BEFORE snapshot: java on PATH + version output + every Java version found on the server
+#     3. Creates /data/stuff/punit if missing and copies the .tar.gz there (skipped if already identical)
+#     4. Extracts it in /data/stuff/punit so the folder is /data/stuff/punit/jdk (bin, lib, conf, ...)
+#     5. Copies jdk/ to /usr/java/jdk (only /usr/java is created; refuses to overwrite a non-empty jdk unless force=true)
+#     5b. Pushes the cacerts file from the CONTROL NODE (default /usr/java/jdk-21.0.1/lib/security/cacerts) over
+#         /usr/java/jdk/lib/security/cacerts; the run stops before touching servers if the file is missing on the control node;
+#         turn off with -e copy_cacerts=false; change the source with -e cacerts_src=<path on the control node>
+#     6. Runs the copied java to prove it works on this server
+#     7. Only with -e create_symlink=true: checks java again and creates the /usr/bin/java and /usr/bin/javac symlinks
+#        ONLY if the target version is not already shown (otherwise no symlink is touched)
+#     8. AFTER snapshot; prints and saves the full before / after / available-versions report
+#
+# Output (control node, report_dir default ./java_deploy_reports):
+#   <host>_java_version.txt     BEFORE / ACTION / AFTER report with available versions per server
+#   java_deploy_summary.csv     one row per server: version, vendor, build, install dir, symlink action, java on PATH
+#
+# Notes: java on PATH is what a non-login sudo shell sees (standard system PATH).
+#        The user running Ansible needs write access to /data/stuff/punit (or its parent) on the control node.
+#        The default URL is the x64 build: aarch64 servers fail step 6 and are left unlinked.
+#        Each server needs ~2x the JDK size free in /data/stuff/punit (archive + extracted folder).
+
+- name: Download JDK once, deploy it on every server and link it where needed
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    dry_run: false
+    java_url: "https://corretto.aws/downloads/resources/21.0.13.1.2/amazon-corretto-21.0.13.1.2-linux-x64.tar.gz"
+    java_sha256: ""
+    java_src: ""               # optional: a local .tar.gz/.tgz on the control node (skips the download)
+    download_dir: /data/stuff/punit
+    keep_staging: true
+    java_dest: /usr/java/jdk
+    java_links:
+      - { name: java,  link: /usr/bin/java }
+      - { name: javac, link: /usr/bin/javac }
+    force: false
+    create_symlink: false      # symlinks are only created when you pass -e create_symlink=true
+    copy_cacerts: true         # push the cacerts file from the control node to every server (-e copy_cacerts=false to skip)
+    cacerts_src: /usr/java/jdk-21.0.1/lib/security/cacerts     # path on the CONTROL NODE (the Ansible server)
+    cacerts_dest: "{{ java_dest }}/lib/security/cacerts"
+    report_dir: "{{ playbook_dir }}/java_deploy_reports"
+
+    # With create_symlink=true: if the java on the server reports exactly this java.version, the symlinks are SKIPPED.
+    target_version: "21.0.13.1"
+
+    # ---- derived ----
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+    archive_path: "{{ java_src if (java_src | length > 0) else (download_dir ~ '/' ~ (java_url | basename)) }}"
+    archive_name: "{{ archive_path | basename }}"
+    srv_archive: "{{ download_dir }}/{{ archive_name }}"      # same folder layout on every server
+    stage_dir: "{{ download_dir }}/jdk"
+    marker_file: "{{ download_dir }}/jdk/.source_archive"
+
+    # ---- read-only shell snippets run on the servers ----
+    java_state_cmd: |
+      J="$(command -v java 2>/dev/null)"
+      if [ -z "$J" ]; then echo "java on PATH : NOT FOUND"; exit 0; fi
+      echo "java on PATH : $J -> $(readlink -f "$J")"
+      jver="$("$J" -XshowSettings:properties -version 2>&1 | awk -F'= ' '/ java.version =/{print $2; exit}')"
+      echo "java.version : ${jver:-unknown}"
+      echo "java --version:"
+      out="$("$J" --version 2>&1)" && echo "$out" || "$J" -version 2>&1
+      if command -v javac >/dev/null 2>&1; then echo "javac        : $(javac -version 2>&1 | head -1)"; else echo "javac        : not on PATH"; fi
+      exit 0
+    java_avail_cmd: |
+      list="$( {
+          for d in /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /bin /sbin; do [ -e "$d/java" ] && echo "$d/java"; done
+          find /usr/java /usr/lib/jvm /usr/lib64/jvm /usr/local /opt /data /app /apps /srv /home /root /u01 /snap \
+               -maxdepth 6 \( -type f -o -type l \) -name java -path '*/bin/java' 2>/dev/null
+        } | while read -r b; do readlink -f "$b"; done | sort -u )"
+      if [ -z "$list" ]; then echo "  none found"; exit 0; fi
+      echo "$list" | while read -r b; do
+        [ -x "$b" ] || continue
+        v="$("$b" --version 2>&1 </dev/null | head -1)"
+        case "$v" in ""|*nrecognized*|*rror*) v="$("$b" -version 2>&1 </dev/null | head -1)";; esac
+        printf '  %s  =>  %s\n' "$b" "$v"
+      done
+      exit 0
+
+  pre_tasks:
+    # ---------- control node: read-only checks (also in dry run) ----------
+    - name: Check the local archive given in java_src (if any)
+      ansible.builtin.assert:
+        that:
+          - java_src is regex('[.](tar[.]gz|tgz)$')
+        fail_msg: "java_src must be a .tar.gz / .tgz file on the control node"
+      run_once: true
+      when: java_src | length > 0
+
+    - name: Check download folder and cached archive on the control node
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: ["{{ download_dir }}", "{{ archive_path }}"]
+      register: prep_stat
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Fail early if the local java_src archive does not exist
+      ansible.builtin.assert:
+        that: prep_stat.results[1].stat.exists
+        fail_msg: "java_src '{{ java_src }}' does not exist on the control node"
+      run_once: true
+      when: java_src | length > 0
+
+    - name: Check the cacerts file on the control node
+      ansible.builtin.stat:
+        path: "{{ cacerts_src }}"
+      register: cacerts_ctl
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: copy_cacerts | bool
+
+    - name: Fail early if the cacerts file is missing on the control node
+      ansible.builtin.assert:
+        that: cacerts_ctl.stat.exists
+        fail_msg: "cacerts_src '{{ cacerts_src }}' does not exist on the control node (use -e cacerts_src=<path> or -e copy_cacerts=false)"
+      run_once: true
+      when: copy_cacerts | bool
+
+    - name: DRY RUN - control node plan
+      ansible.builtin.debug:
+        msg:
+          - "DRY RUN - nothing will be changed"
+          - "Source          : {{ ('local archive ' ~ java_src) if java_src | length > 0 else ('download ' ~ java_url) }}"
+          - "Download folder : {{ download_dir }}  ({{ 'exists' if prep_stat.results[0].stat.exists else 'would be CREATED' }})"
+          - "Archive         : {{ archive_path }}  ({{ 'already present' if prep_stat.results[1].stat.exists else 'would be DOWNLOADED' }})"
+          - "Then, on every server: copy it to {{ download_dir }}, extract to {{ stage_dir }}, copy to {{ java_dest }}"
+          - "cacerts         : {{ ('would be copied from the control node (' ~ cacerts_src ~ ') to ' ~ cacerts_dest ~ ' on every server') if (copy_cacerts | bool) else 'copy disabled (copy_cacerts=false)' }}"
+          - "Symlinks        : {{ ('NOT requested - none will be touched (pass -e create_symlink=true to create ' ~ (java_links | map(attribute='link') | join(', ')) ~ ')') if not (create_symlink | bool) else (java_links | map(attribute='link') | join(', ') ~ '  (only where the target version is not already shown)') }}"
+      run_once: true
+      when: is_dry | bool
+
+    # ---------- control node: real run - download once ----------
+    - name: Create download folder on the control node (once)
+      ansible.builtin.file:
+        path: "{{ download_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: not (is_dry | bool)
+
+    - name: Create the report folder on the control node (once)
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: not (is_dry | bool)
+
+    - name: Download the JDK archive (once)
+      ansible.builtin.get_url:
+        url: "{{ java_url }}"
+        dest: "{{ archive_path }}"
+        checksum: "{{ ('sha256:' ~ java_sha256) if (java_sha256 | length > 0) else omit }}"
+        mode: "0644"
+        timeout: 120
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: not (is_dry | bool) and java_src | length == 0
+
+  tasks:
+    # ---------- BEFORE snapshot (read-only, also in dry run) ----------
+    - name: BEFORE - java on PATH and its version output
+      ansible.builtin.shell: "{{ java_state_cmd }}"
+      register: before_state
+      changed_when: false
+      check_mode: false
+
+    - name: BEFORE - all Java versions available on the server
+      ansible.builtin.shell: "{{ java_avail_cmd }}"
+      register: before_avail
+      changed_when: false
+      check_mode: false
+
+    - name: Does java already show the target version?
+      ansible.builtin.set_fact:
+        before_matches: "{{ (before_state.stdout | regex_search('java[.]version : (\\S+)', '\\1') | default([''], true) | first) == target_version }}"
+
+    - name: Check destination
+      ansible.builtin.stat:
+        path: "{{ java_dest }}"
+      register: dest_stat
+
+    - name: List existing destination content
+      ansible.builtin.find:
+        paths: "{{ java_dest }}"
+        file_type: any
+      register: dest_find
+      when: dest_stat.stat.exists
+
+    - name: Work out whether destination already holds something
+      ansible.builtin.set_fact:
+        dest_nonempty: "{{ dest_stat.stat.exists and ((dest_find.matched | default(0)) > 0) }}"
+        backup_suffix: "{{ now(fmt='%Y%m%d%H%M%S') }}"
+
+    - name: Which java.version is already in {{ java_dest }}?
+      ansible.builtin.shell: "{{ java_dest }}/bin/java -XshowSettings:properties -version 2>&1 | awk -F'= ' '/ java.version =/{print $2; exit}'"
+      register: dest_ver
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      when: dest_nonempty
+
+    - name: Is the target JDK already deployed there?
+      ansible.builtin.set_fact:
+        already_deployed: "{{ dest_nonempty and ((dest_ver.stdout | default('') | trim) == target_version) }}"
+
+    # do_deploy = staging + copy is needed. False in a dry run, or when the target version is already in java_dest
+    # (so a re-run does not need force=true; use -e force=true to redeploy anyway).
+    - name: Decide whether the JDK has to be staged and copied
+      ansible.builtin.set_fact:
+        do_deploy: "{{ not (is_dry | bool) and not ((already_deployed | bool) and not (force | bool)) }}"
+
+    - name: Check what is already staged on the server
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: ["{{ download_dir }}", "{{ srv_archive }}", "{{ stage_dir }}/bin/java"]
+      register: srv_stat
+
+    - name: Check whether the links exist now
+      ansible.builtin.stat:
+        path: "{{ item.link }}"
+      loop: "{{ java_links }}"
+      register: link_before
+
+    - name: Current link state
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.link }}:
+          {{ ('currently symlink -> ' ~ item.stat.lnk_source) if (item.stat.exists and item.stat.islnk)
+             else ('currently a REAL FILE (needs force=true to replace)' if item.stat.exists else 'does not exist') }}
+      loop: "{{ link_before.results }}"
+      loop_control:
+        label: "{{ item.item.link }}"
+
+    # ---------- DRY RUN: per-server plan ----------
+    - name: DRY RUN - plan for this server
+      ansible.builtin.debug:
+        msg:
+          - "DRY RUN - nothing changed on {{ inventory_hostname }}"
+          - "{{ before_state.stdout_lines | first }}"
+          - "Target version already shown by java? {{ 'YES' if before_matches else 'NO' }}"
+          - "Symlinks: {{ 'NOT requested - none would be touched (pass -e create_symlink=true)' if not (create_symlink | bool) else ('would be SKIPPED - java already shows the target version' if before_matches else 'would be CREATED / UPDATED') }}"
+          - "Available Java versions now:"
+          - "{{ before_avail.stdout }}"
+          - "Staging {{ download_dir }}: {{ 'exists' if srv_stat.results[0].stat.exists else 'would be CREATED' }}; archive {{ 'already on server' if srv_stat.results[1].stat.exists else 'would be COPIED from the control node' }}; {{ 'already extracted' if srv_stat.results[2].stat.exists else 'would be EXTRACTED to ' ~ stage_dir }}"
+          - "{{ java_dest }}: {{ ('ALREADY has java.version ' ~ target_version ~ ' -> copy would be SKIPPED (use -e force=true to redeploy)') if already_deployed else (('EXISTS and is not empty (java.version ' ~ (dest_ver.stdout | default('?') | trim) ~ ') -> real run would STOP unless -e force=true (then backup to ' ~ java_dest ~ '.bak-<time>)') if dest_nonempty else ('exists but empty' if dest_stat.stat.exists else 'does not exist')) }}"
+          - "{{ 'Nothing to copy; would test java, check the version/symlinks, then report.' if already_deployed else ('Would copy ' ~ stage_dir ~ ' -> ' ~ java_dest ~ ' (parent ' ~ (java_dest | dirname) ~ ' created if missing), test the copied java, check java again, then report.') }}"
+      when: is_dry | bool
+
+    # ---------- real run, on the server: stage ----------
+    - name: Refuse to overwrite an existing JDK unless force=true
+      ansible.builtin.fail:
+        msg: >-
+          {{ java_dest }} already exists and is not empty. Re-run with -e force=true to rename it to
+          {{ java_dest }}.bak-{{ backup_suffix }} and install the new JDK.
+      when: (do_deploy | bool) and dest_nonempty and not (force | bool)
+
+    - name: Create the staging folder on the server (once)
+      ansible.builtin.file:
+        path: "{{ download_dir }}"
+        state: directory
+        mode: "0755"
+      when: (do_deploy | bool)
+
+    - name: Copy the .tar.gz from the control node to the server
+      ansible.builtin.copy:
+        src: "{{ archive_path }}"
+        dest: "{{ srv_archive }}"
+        mode: "0644"
+      when: (do_deploy | bool)
+
+    - name: Check which archive the staged jdk/ was extracted from
+      ansible.builtin.stat:
+        path: "{{ marker_file }}"
+      register: marker
+      when: (do_deploy | bool)
+
+    - name: Read that marker
+      ansible.builtin.slurp:
+        src: "{{ marker_file }}"
+      register: marker_content
+      when: (do_deploy | bool) and marker.stat.exists
+
+    - name: Remove a staged jdk/ left over from a different archive
+      ansible.builtin.file:
+        path: "{{ stage_dir }}"
+        state: absent
+      when: >-
+        (do_deploy | bool) and
+        (not marker.stat.exists or (marker_content.content | b64decode | trim) != archive_name)
+
+    - name: Create the jdk/ folder to extract into (unarchive needs an existing dest)
+      ansible.builtin.file:
+        path: "{{ stage_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: (do_deploy | bool)
+
+    - name: Extract the archive on the server into jdk/ (top-level folder removed)
+      ansible.builtin.unarchive:
+        src: "{{ srv_archive }}"
+        dest: "{{ stage_dir }}"
+        remote_src: true
+        owner: root
+        group: root
+        extra_opts: ["--strip-components=1"]
+        creates: "{{ stage_dir }}/bin/java"
+      when: (do_deploy | bool)
+
+    - name: Remember which archive jdk/ came from
+      ansible.builtin.copy:
+        content: "{{ archive_name }}\n"
+        dest: "{{ marker_file }}"
+        mode: "0644"
+      when: (do_deploy | bool)
+
+    - name: Check the extracted JDK has bin/java
+      ansible.builtin.stat:
+        path: "{{ stage_dir }}/bin/java"
+      register: stage_bin
+      when: (do_deploy | bool)
+
+    - name: Validate the extracted JDK
+      ansible.builtin.assert:
+        that: stage_bin.stat.exists
+        fail_msg: "{{ stage_dir }}/bin/java not found - the archive is not a JDK with the expected layout"
+      when: (do_deploy | bool)
+
+    # ---------- real run, on the server: deploy to /usr/java/jdk ----------
+    - name: Back up the existing JDK (force=true)
+      ansible.builtin.command: "mv {{ java_dest }} {{ java_dest }}.bak-{{ backup_suffix }}"
+      when: (do_deploy | bool) and dest_nonempty and (force | bool)
+
+    - name: Remove an empty {{ java_dest }} so the copy can create it
+      ansible.builtin.file:
+        path: "{{ java_dest }}"
+        state: absent
+      when: (do_deploy | bool) and dest_stat.stat.exists and not dest_nonempty
+
+    # Only the parent (/usr/java) is created - the jdk folder itself comes from the copy
+    - name: Make sure the parent directory exists
+      ansible.builtin.file:
+        path: "{{ java_dest | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: (do_deploy | bool)
+
+    - name: Copy jdk/ to {{ java_dest }} on the server (local copy, keeps permissions)
+      ansible.builtin.command: "cp -a {{ stage_dir }} {{ java_dest }}"
+      args:
+        creates: "{{ java_dest }}/bin/java"
+      when: (do_deploy | bool)
+
+    # The same cacerts (company CAs etc.) is pushed from the control node to every server, replacing the default one.
+    - name: Copy cacerts from the control node into the new JDK
+      ansible.builtin.copy:
+        src: "{{ cacerts_src }}"
+        dest: "{{ cacerts_dest }}"
+        owner: root
+        group: root
+        mode: preserve
+      when: (do_deploy | bool) and (copy_cacerts | bool)
+
+    - name: Test the copied java on this server (wrong CPU architecture or a broken copy fails here)
+      ansible.builtin.command: "{{ java_dest }}/bin/java -version"
+      register: pre_test
+      changed_when: false
+      when: not (is_dry | bool)
+
+    # ---------- check java version, THEN decide about the symlinks ----------
+    - name: Check what java shows right before linking
+      ansible.builtin.shell: "{{ java_state_cmd }}"
+      register: java_now
+      changed_when: false
+      when: not (is_dry | bool)
+
+    - name: Does java already show the target version?
+      ansible.builtin.set_fact:
+        link_needed: "{{ (create_symlink | bool) and ((java_now.stdout | regex_search('java[.]version : (\\S+)', '\\1') | default([''], true) | first) != target_version) }}"
+      when: not (is_dry | bool)
+
+    - name: Symlinks NOT requested (no create_symlink argument)
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: symlinks not created - pass -e create_symlink=true to create them."
+      when: not (is_dry | bool) and not (create_symlink | bool)
+
+    - name: Symlinks SKIPPED - java already shows the target version
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: java already reports version {{ target_version }} - symlinks not created."
+      when: not (is_dry | bool) and (create_symlink | bool) and not (link_needed | bool)
+
+    - name: Check whether the new JDK has javac (JDK vs JRE)
+      ansible.builtin.stat:
+        path: "{{ java_dest }}/bin/javac"
+      register: javac_stat
+      when: not (is_dry | bool) and (link_needed | bool)
+
+    - name: Create symlinks to the new JDK (only where the target version is not shown)
+      ansible.builtin.file:
+        src: "{{ java_dest }}/bin/{{ item.name }}"
+        dest: "{{ item.link }}"
+        state: link
+        force: "{{ force | bool }}"
+      loop: "{{ java_links }}"
+      loop_control:
+        label: "{{ item.link }}"
+      when: not (is_dry | bool) and (link_needed | bool) and (item.name != 'javac' or javac_stat.stat.exists)
+
+    # ---------- AFTER snapshot + report ----------
+    - name: AFTER - java on PATH and its version output
+      ansible.builtin.shell: "{{ java_state_cmd }}"
+      register: after_state
+      changed_when: false
+      when: not (is_dry | bool)
+
+    - name: AFTER - all Java versions available on the server
+      ansible.builtin.shell: "{{ java_avail_cmd }}"
+      register: after_avail
+      changed_when: false
+      when: not (is_dry | bool)
+
+    - name: Read vendor and full build of the deployed JDK
+      ansible.builtin.command: "{{ java_dest }}/bin/java -XshowSettings:properties -version"
+      register: props
+      changed_when: false
+      when: not (is_dry | bool)
+
+    - name: Build the report
+      ansible.builtin.set_fact:
+        symlink_action: "{{ 'CREATED/UPDATED' if (link_needed | bool) else ('SKIPPED (already shows target version)' if (create_symlink | bool) else 'NOT REQUESTED (no create_symlink argument)') }}"
+        jv: "{{ props.stderr | regex_search('java[.]version = (\\S+)', '\\1') | default(['unknown'], true) | first }}"
+        jvendor: "{{ props.stderr | regex_search('java[.]vendor = ([^\\n]+)', '\\1') | default(['unknown'], true) | first }}"
+        jbuild: "{{ props.stderr | regex_search('java[.]runtime[.]version = (\\S+)', '\\1') | default(['unknown'], true) | first }}"
+      when: not (is_dry | bool)
+
+    - name: Build the before / after text
+      ansible.builtin.set_fact:
+        java_report_text: |
+          ===== {{ inventory_hostname }}  ({{ now(fmt='%Y-%m-%d %H:%M:%S') }}) =====
+          Target version  : {{ target_version }}
+          Deployed JDK    : {{ java_dest }}  ({{ jv }}, {{ jvendor }}, build {{ jbuild }})
+          Deploy step     : {{ ('SKIPPED - ' ~ java_dest ~ ' already had ' ~ target_version) if (already_deployed and not (force | bool)) else ('COPIED to ' ~ java_dest) }}
+          Symlinks        : {{ symlink_action }}
+
+          ----- BEFORE -----
+          {{ before_state.stdout }}
+          Target version shown before? {{ 'YES' if before_matches else 'NO' }}
+          Available Java versions before:
+          {{ before_avail.stdout }}
+
+          ----- AFTER -----
+          {{ after_state.stdout }}
+          Available Java versions after:
+          {{ after_avail.stdout }}
+        deploy_row: "{{ inventory_hostname }},{{ jv }},{{ jvendor | replace(',', ' ') }},{{ jbuild }},{{ java_dest }},{{ symlink_action | replace(',', ' ') }},{{ (after_state.stdout_lines | first) | replace(',', ' ') }}"
+      when: not (is_dry | bool)
+
+    - name: Show before / after / available versions
+      ansible.builtin.debug:
+        msg: "{{ java_report_text.split('\n') }}"
+      when: not (is_dry | bool)
+
+    - name: Save the report on the control node
+      ansible.builtin.copy:
+        content: "{{ java_report_text }}"
+        dest: "{{ report_dir }}/{{ inventory_hostname }}_java_version.txt"
+        mode: "0644"
+      delegate_to: localhost
+      become: false
+      when: not (is_dry | bool)
+
+    - name: Remove the archive and extracted jdk/ from the server (keep_staging=false)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: ["{{ srv_archive }}", "{{ stage_dir }}"]
+      when: not (is_dry | bool) and not (keep_staging | bool)
+
+- name: Consolidated version report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dry_run: false
+    report_dir: "{{ playbook_dir }}/java_deploy_reports"
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+  tasks:
+    - name: Make sure the report folder exists
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      when: not (is_dry | bool)
+
+    - name: Write java_deploy_summary.csv
+      ansible.builtin.copy:
+        content: |
+          host,java_version,vendor,runtime_build,install_dir,symlink_action,java_on_path_after
+          {% for h in groups['all'] if hostvars[h].deploy_row is defined %}
+          {{ hostvars[h].deploy_row }}
+          {% endfor %}
+        dest: "{{ report_dir }}/java_deploy_summary.csv"
+        mode: "0644"
+      when: not (is_dry | bool)
+
+    - name: Show summary
+      ansible.builtin.debug:
+        msg: "{{ ['host,java_version,vendor,runtime_build,install_dir,symlink_action,java_on_path_after'] + (groups['all'] | select('in', hostvars) | map('extract', hostvars, 'deploy_row') | select('defined') | list) }}"
+      when: not (is_dry | bool)

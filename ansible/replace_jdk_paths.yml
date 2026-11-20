@@ -1,0 +1,274 @@
+---
+# replace_jdk_paths.yml - find /<path>/jdk-<version> references in service/config/script files and replace them
+# with /usr/java/jdk.   e.g.  JAVA_HOME=/opt/jdk-17.0.5/bin  ->  JAVA_HOME=/usr/java/jdk/bin
+#
+# Usage:
+#   ansible-playbook -i inventory.ini replace_jdk_paths.yml -e dry_run=true      # DRY RUN: lists what would change, edits nothing
+#   ansible-playbook -i inventory.ini replace_jdk_paths.yml --check              # same as dry_run=true
+#   ansible-playbook -i inventory.ini replace_jdk_paths.yml -l web01             # real run, one server first
+#   ansible-playbook -i inventory.ini replace_jdk_paths.yml                      # real run, all servers
+#   ... -e daemon_reload=false         # skip the `systemctl daemon-reload` that otherwise runs on every server after the replace
+#   ... -e skip_jdk_check=true         # do not require /usr/java/jdk/bin/java to exist
+#
+# Files searched (same places as your grep/find commands; edit scan_targets to add more):
+#   /etc/systemd/system        every file, recursive
+#   /etc/default               every file
+#   /etc/init.d                every file
+#   /data/asitemicroapps       *.sh, recursive
+#   /data/wildfly/bin/service_*/   *.conf and *.sh, recursive (e.g. service_x/conf/wrapper.conf)
+#   Symlinks are skipped (e.g. enabled units that link into /usr/lib/systemd) - the real file is not edited through a link.
+#
+# What is replaced: a FULL path whose last folder is jdk-<something>, e.g. /opt/jdk-17.0.5  /usr/java/jdk-21.0.2  /jdk-8
+#   The whole path up to and including that folder becomes /usr/java/jdk; anything after it (/bin/java) is kept.
+#   Several paths on one line (PATH=/a/jdk-1/bin:/b/jdk-2/bin) are each replaced.
+#
+# What is NOT replaced (listed in the report as MANUAL REVIEW instead):
+#   - bare names without a full path (JDK=jdk-17.0.5), paths built from variables (${BASE}/jdk-17, $HOME/jdk-17)
+#   - folders ending in -unused, and /usr/java/jdk itself (already correct)
+#
+# Safety:
+#   - every file is backed up first to /var/backups/jdk_path_replace/<timestamp>/<original path>
+#     restore on the server:  cp -a /var/backups/jdk_path_replace/<timestamp>/. /
+#   - refuses to run if /usr/java/jdk/bin/java does not exist (nothing would work after the change) unless skip_jdk_check=true
+#   - services are NOT restarted: a running service keeps the old Java until restarted.
+#     After the replace step `systemctl daemon-reload` runs on every server (real run only; it re-reads unit files and restarts nothing).
+#     Disable with -e daemon_reload=false.
+#
+# Output (control node, report_dir default ./java_replace_reports):  replace_report.csv
+#   (host, type [REPLACE / MANUAL REVIEW], file, line, action, text)
+
+- name: Replace jdk-* paths with /usr/java/jdk in service and script files
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    dry_run: false
+    java_dest: /usr/java/jdk
+    skip_jdk_check: false
+    daemon_reload: true        # run `systemctl daemon-reload` on every server after the replace step (-e daemon_reload=false to skip)
+    backup_root: /var/backups/jdk_path_replace
+    report_dir: "{{ playbook_dir }}/java_replace_reports"
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+
+    scan_targets:
+      - { path: /etc/systemd/system, patterns: "*",    recurse: true }
+      - { path: /etc/default,        patterns: "*",    recurse: false }
+      - { path: /etc/init.d,         patterns: "*",    recurse: false }
+      - { path: /data/asitemicroapps, patterns: "*.sh", recurse: true }
+      # service_* folders: find cannot glob folder names, so it searches /data/wildfly/bin and "only" keeps the files
+      # whose full path matches that regex (here: inside a service_* folder).  "only" is optional on any entry.
+      - { path: /data/wildfly/bin, patterns: ["*.conf", "*.sh"], recurse: true, only: "^/data/wildfly/bin/service_[^/]+/" }
+
+    # Full path ending in a jdk-<x> folder. Used by BOTH the report (Python scan) and the edit (Ansible replace).
+    #  - must start at line start or after whitespace = : ; " ' (   (so ${HOME}/jdk-17 is not touched)
+    #  - not a -unused folder, and must end at / whitespace : ; " ' ) or end of line
+    jdk_path_regex: |-
+      (?:(?<=[\s=:;"'(])|^)/(?:[^\s:;"'=$]*/)?jdk-[^/\s:;"'$]*(?<!-unused)(?=[/\s:;"')]|$)
+
+    # Python used on the servers = the interpreter Ansible already uses there (no grep -P needed).
+    py_bin: "{{ ansible_python_interpreter | default(ansible_facts['discovered_interpreter_python'] | default('python3')) }}"
+
+    # Lists every line that mentions jdk-: REPLACE (matches the path regex) or REVIEW (does not). Works on Python 2.6+ and 3.
+    scan_py: |
+      import os, re, sys
+
+      def emit(s):
+          if sys.version_info[0] >= 3:
+              sys.stdout.write(s + "\n")
+          else:
+              sys.stdout.write(s.encode("utf-8") + "\n")
+
+      pat = re.compile(os.environ["V_PAT"])
+      for f in os.environ.get("V_FILES", "").split("\n"):
+          if not f or not os.path.isfile(f):
+              continue
+          try:
+              fh = open(f, "rb")
+              data = fh.read()
+              fh.close()
+          except Exception:
+              continue
+          if b"\0" in data:
+              continue
+          text = data.decode("utf-8", "replace")
+          name = f
+          if sys.version_info[0] < 3:
+              name = f.decode("utf-8", "replace")
+          n = 0
+          for line in text.split("\n"):
+              n += 1
+              line = line.rstrip("\r")
+              if "jdk-" not in line:
+                  continue
+              kind = "REPLACE" if pat.search(line) else "REVIEW"
+              emit(u"%s|%s|%d|%s" % (kind, name, n, line))
+
+  tasks:
+    # ---------- 1. find candidate files (read-only) ----------
+    - name: Find files that mention jdk-
+      ansible.builtin.find:
+        paths: "{{ item.path }}"
+        patterns: "{{ item.patterns }}"
+        recurse: "{{ item.recurse }}"
+        file_type: file
+        contains: ".*jdk-"        # the find module matches from the START of each line, so ".*" is required to match mid-line
+        follow: false
+      loop: "{{ scan_targets }}"
+      loop_control:
+        label: "{{ item.path }}"
+      register: found
+      check_mode: false
+
+    # Collect the files of every scan_targets entry; an entry with "only" keeps just the paths matching that regex.
+    - name: List the candidate files
+      ansible.builtin.set_fact:
+        cand_files: >-
+          {%- set out = [] -%}
+          {%- for r in found.results -%}
+          {%- for f in r.files -%}
+          {%- if (r.item.only is not defined) or (f.path is match(r.item.only)) -%}
+          {%- if out.append(f.path) -%}{%- endif -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ out | unique | sort | list }}
+
+    # ---------- 2. list the exact lines (read-only) ----------
+    - name: Scan the files for jdk-* references
+      ansible.builtin.command:
+        argv: ["{{ py_bin }}", "-"]
+        stdin: "{{ scan_py }}"
+      environment:
+        V_FILES: "{{ cand_files | join('\n') }}"
+        V_PAT: "{{ jdk_path_regex }}"
+      register: scan
+      changed_when: false
+      check_mode: false
+
+    - name: Sort the findings
+      ansible.builtin.set_fact:
+        hits: "{{ scan.stdout_lines | select('match', '^(REPLACE|REVIEW)[|]') | list }}"
+        rep_files: "{{ scan.stdout_lines | select('match', '^REPLACE[|]') | map('regex_replace', '^REPLACE[|]([^|]*)[|].*$', '\\1') | unique | sort | list }}"
+        rep_lines: "{{ scan.stdout_lines | select('match', '^REPLACE[|]') | list }}"
+        rev_lines: "{{ scan.stdout_lines | select('match', '^REVIEW[|]') | list }}"
+        rep_dry: "{{ is_dry | bool }}"
+
+    - name: Show what was found
+      ansible.builtin.debug:
+        msg: >-
+          {{ (['DRY RUN - no file is changed'] if (is_dry | bool) else [])
+             + [(rep_files | length) ~ ' file(s) / ' ~ (rep_lines | length) ~ ' line(s) would be replaced with ' ~ java_dest
+                ~ ', ' ~ (rev_lines | length) ~ ' line(s) need MANUAL REVIEW']
+             + (rep_lines | map('regex_replace', '^REPLACE[|]', '[REPLACE] ') | map('replace', '|', ' : ', 2) | list)
+             + (rev_lines | map('regex_replace', '^REVIEW[|]', '[REVIEW ] ') | map('replace', '|', ' : ', 2) | list) }}
+
+    # ---------- 3. safety checks ----------
+    - name: Check that the target JDK exists on this server
+      ansible.builtin.stat:
+        path: "{{ java_dest }}/bin/java"
+      register: jdk_stat
+
+    - name: Warn in a dry run if the target JDK is missing
+      ansible.builtin.debug:
+        msg: "WARNING: {{ java_dest }}/bin/java does not exist on {{ inventory_hostname }} - a real run would stop here (deploy the JDK first)."
+      when: (is_dry | bool) and not jdk_stat.stat.exists and (rep_files | length) > 0
+
+    - name: Refuse to point files at a JDK that is not there
+      ansible.builtin.fail:
+        msg: "{{ java_dest }}/bin/java does not exist on {{ inventory_hostname }}. Deploy the JDK first (deploy_java.yml) or use -e skip_jdk_check=true."
+      when: not (is_dry | bool) and (rep_files | length) > 0 and not jdk_stat.stat.exists and not (skip_jdk_check | bool)
+
+    # ---------- 4. back up, then replace ----------
+    - name: Work out the backup folder
+      ansible.builtin.set_fact:
+        backup_dir: "{{ backup_root }}/{{ now(fmt='%Y%m%d%H%M%S') }}"
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Create the backup folder
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Back up every file that will be changed (original path is kept under the backup folder)
+      ansible.builtin.command:
+        argv: [cp, -p, --parents, "{{ item }}", "{{ backup_dir }}/"]
+      loop: "{{ rep_files }}"
+      changed_when: true
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Replace the jdk-* paths with {{ java_dest }}
+      ansible.builtin.replace:
+        path: "{{ item }}"
+        regexp: "{{ jdk_path_regex }}"
+        replace: "{{ java_dest }}"
+      loop: "{{ rep_files }}"
+      register: replace_res
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    # Runs on every server once the replace step above is finished (a reload only re-reads unit files, it restarts nothing).
+    # Skipped in a dry run, and with -e daemon_reload=false. Servers without systemd are skipped with a message.
+    - name: systemd daemon-reload (after the replace step)
+      ansible.builtin.shell: |
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl daemon-reload && echo "daemon-reload done"
+        else
+          echo "systemctl not found - daemon-reload skipped"
+        fi
+      register: dreload
+      changed_when: "'daemon-reload done' in dreload.stdout"
+      when: not (is_dry | bool) and (daemon_reload | bool)
+
+    # ---------- 5. verify ----------
+    - name: Scan again to confirm nothing replaceable is left
+      ansible.builtin.command:
+        argv: ["{{ py_bin }}", "-"]
+        stdin: "{{ scan_py }}"
+      environment:
+        V_FILES: "{{ rep_files | join('\n') }}"
+        V_PAT: "{{ jdk_path_regex }}"
+      register: scan_after
+      changed_when: false
+      when: not (is_dry | bool) and (rep_files | length) > 0
+
+    - name: Result for this server
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ ((rep_files | length) ~ ' file(s) WOULD be changed, ' ~ (rev_lines | length) ~ ' line(s) need manual review') if (is_dry | bool)
+             else ((rep_files | length) ~ ' file(s) changed (backup: ' ~ (backup_dir | default('none')) ~ '); replaceable lines left: '
+                   ~ ((scan_after.stdout_lines | default([]) | select('match', '^REPLACE[|]') | list | length) if (rep_files | length) > 0 else 0)
+                   ~ '; ' ~ (rev_lines | length) ~ ' line(s) need manual review; '
+                   ~ ((dreload.stdout | default('') | trim) if (daemon_reload | bool) else 'daemon-reload disabled (daemon_reload=false)')
+                   ~ '. Restart services to use the new path') }}
+
+- name: Replace report
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    dry_run: false
+    report_dir: "{{ playbook_dir }}/java_replace_reports"
+    is_dry: "{{ (dry_run | bool) or ansible_check_mode }}"
+  tasks:
+    - name: Create the report folder
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: "0755"
+      when: not (is_dry | bool)
+
+    - name: Write replace_report.csv
+      ansible.builtin.copy:
+        content: |
+          host,type,file,line,action,text
+          {% for h in groups['all'] if hostvars[h].hits is defined %}
+          {% for x in hostvars[h].hits %}
+          {% set f = x.split('|', 3) %}
+          {{ h }},{{ 'REPLACE' if f[0] == 'REPLACE' else 'MANUAL REVIEW' }},{{ f[1] }},{{ f[2] }},{{ ('WOULD REPLACE' if hostvars[h].rep_dry else 'REPLACED') if f[0] == 'REPLACE' else 'NOT CHANGED - review by hand' }},"{{ f[3] | replace('"', '""') }}"
+          {% endfor %}
+          {% endfor %}
+        dest: "{{ report_dir }}/replace_report.csv"
+        mode: "0644"
+      when: not (is_dry | bool)
